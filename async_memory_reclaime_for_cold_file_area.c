@@ -575,8 +575,9 @@ static unsigned int async_shrink_free_page(struct pglist_data *pgdat,struct lruv
 	/****page是脏页*********************/
 	if (PageDirty(page)) {
                 nr_dirty++;
-                //goto activate_locked;	       
-		goto keep;
+                goto activate_locked;	       
+		//这里goto keep 分支，忘了unlock_page()了，导致其他进程访问到该page时因为page lock就休眠了
+		//goto keep;
 	}
 
 	/*******释放page的bh******************/
@@ -689,6 +690,9 @@ static int __hot_file_isolate_lru_pages(pg_data_t *pgdat,struct page * page,stru
 	    //把page从lru链表剔除，并减少page所属lru链表的page数
 	    //del_page_from_lru_list(page, lruvec, lru + PageActive(page));
 	    del_page_from_lru_list_async(page, lruvec, lru + PageActive(page));
+	    //如果page在active lru链表上则要清理掉Active属性，因为内存回收的page一定是处于inactive lru链表，否则内存回收最后会因为page有PageActive属性而触发crash
+	    if(PageActive(page))
+		ClearPageActive(page);
 	    //再把page添加到dst临时链表
 	    list_add(&page->lru,dst);
 	    return 0;
@@ -1127,8 +1131,9 @@ retry:
 		if (PageDirty(page)) {
                     if(open_shrink_printk)
 		        printk("3:%s %s %d page:0x%llx page->flags:0x%lx PageDirtyn",__func__,current->comm,current->pid,(u64)page,page->flags);
-		    //goto activate_locked;
-		    goto keep;
+		    goto activate_locked;
+		    //这里goto keep 分支，忘了unlock_page()了，导致其他进程访问到该page时因为page lock就休眠了!!!!!!!!!!!!!!!!
+		    //goto keep;
 		}
 
 		if (page_has_private(page)) {
@@ -1343,6 +1348,9 @@ static int  __hot_file_isolate_lru_pages(pg_data_t *pgdat,struct page * page,str
     lruvec = mem_cgroup_lruvec_async(page_memcg(page), pgdat);
     //把page从lru链表剔除，同时更新各种page在lru链表有关的各种统计计数
     del_page_from_lru_list_async(page, lruvec);
+    //如果page在active lru链表上则要清理掉Active属性，因为内存回收的page一定是处于inactive lru链表，否则内存回收最后会因为page有PageActive属性而触发crash
+    if(PageActive(page))
+        ClearPageActive(page);
     //再把page添加到dst临时链表 
     list_add(&page->lru,dst);
 
@@ -2360,6 +2368,8 @@ int hot_file_update_file_status(struct page *page)
         struct hot_file_stat * p_hot_file_stat = NULL;
         struct hot_file_area *p_hot_file_area = NULL; 
 
+	//与 __destroy_inode_handler_post()函数删除file_stat的smp_wmb()成对，详细看注释
+	smp_rmb();
 	//如果两个进程同时访问同一个文件的page0和page1，这就就有问题了，因为这个if会同时成立。然后下边针对
 	if(mapping->rh_reserved1 == 0 ){
 
@@ -3692,11 +3702,19 @@ static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 	//但分配后会先对inode清0，inode->mapping 和 inode->mapping->rh_reserved1 全是0，不会受inode->mapping->rh_reserved1指向的老hot_file_stat结构的影响。只用异步内存回收线程
 	//里这个hot_file_stat对应的hot file tree中的节点hot_file_area_tree_node结构和该文件的所有file_area结构。
 	if(p_hot_file_stat->mapping == inode->i_mapping){
+	    //xfs文件系统不会对新分配的inode清0，因此要主动对inode->i_mapping->rh_reserved1清0，防止该file_stat和inode被释放后。立即被其他进程分配了这个inode，但是没有对
+	    //inode清0，导致inode->i_mapping->rh_reserved1还保存着老的已经释放的file_stat，因为inode->i_mapping->rh_reserved1不是0，不对这个file_stat初始化，
+	    //然后把file_area添加到这个无效file_stat，就要crash。但是要把inode->i_mapping->rh_reserved1 = 0放到set_file_stat_in_delete(p_hot_file_stat)
+	    //前边。否则的话，set_file_stat_in_delete(p_hot_file_stat)标记file_stat的delete标记位后，file_stat不能再被用到，但是inode->i_mapping->rh_reserved1还不是0，
+	    //这样可能inode->i_mapping->rh_reserved1指向的file_stat还会被添加file_area，会出问题的，导致crash都有可能!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	    inode->i_mapping->rh_reserved1 = 0;
+	    smp_wmb(); 
 	    //这里有个很大的隐患，此时file_stat可能处于global hot_file_head、hot_file_head_temp、hot_file_head_temp_large 3个链表，这里突然设置set_file_stat_in_delete，
 	    //将来这些global 链表遍历这个file_stat，发现没有 file_stat_in_hot_file_head等标记，会主动触发panic()。不对，set_file_stat_in_delete并不会清理原有的
 	    //file_stat_in_hot_file_head等标记，杞人忧天了。
             set_file_stat_in_delete(p_hot_file_stat);
-	    smp_wmb();
+	    //inode->i_mapping->rh_reserved1 = NULL;
+	    //smp_wmb();
 	    printk("hot_file_stat:0x%llx delete !!!!!!!!!!!!!!!!\n",(u64)p_hot_file_stat);
 	}
     }
@@ -3746,4 +3764,4 @@ static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
 module_init(async_memory_reclaime_for_cold_file_area_init);
 module_exit(async_memory_reclaime_for_cold_file_area_exit);
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("hujunpeng/dongzhiyan_linux@163.com");
+MODULE_AUTHOR("hujunpeng : dongzhiyan_linux@163.com");
