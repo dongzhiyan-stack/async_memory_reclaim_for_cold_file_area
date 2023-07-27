@@ -55,6 +55,9 @@ int hot_file_shrink_enable = 8388624;
 void inline update_async_shrink_page(struct page *page);
 int hot_file_init(void);
 /***************************************************************/
+//最大文件名字长度
+#define MAX_FILE_NAME_LEN 100
+
 //一个 hot_file_area 包含的page数，默认6个
 #define PAGE_COUNT_IN_AREA_SHIFT 3
 #define PAGE_COUNT_IN_AREA (1UL << PAGE_COUNT_IN_AREA_SHIFT)
@@ -145,6 +148,8 @@ struct hot_file_stat
     //unsigned int file_area_count_in_cold_list;
     //上一轮扫描移动到hot_file_area_cold链表的file_area个数
     //unsigned int old_file_area_count_in_cold_list;
+    //file_stat里age最大的file_area的age
+    unsigned long max_file_area_age;
 };
 struct hot_file_node_pgdat
 {
@@ -2479,6 +2484,9 @@ already_alloc:
 	    //hot_file_global_info.global_age更新了，把最新的global age更新到本次访问的hot_file_area->file_area_age。并对hot_file_area->area_access_count清0，本周期被访问1次则加1
 	    if(p_hot_file_area->file_area_age < hot_file_global_info.global_age){
 		p_hot_file_area->file_area_age = hot_file_global_info.global_age;
+		if(p_hot_file_area->file_area_age > p_hot_file_stat->max_file_area_age)
+                    p_hot_file_stat->max_file_area_age = p_hot_file_area->file_area_age;
+
 	        p_hot_file_area->area_access_count = 0;
 	    }
 	    //file_area区域的page被访问的次数加1
@@ -2962,35 +2970,90 @@ static unsigned long hot_file_shrink_pages(struct hot_file_global *p_hot_file_gl
     return 0;
 }
 #else
+static void get_file_name(char *file_name_path,struct hot_file_stat * p_hot_file_stat)
+{
+    char file_name_path_tmp[MAX_FILE_NAME_LEN];
+    struct dentry *dentry = NULL;
+    unsigned int name_len = 0;
+
+    file_name_path[0] = '\0';
+    file_name_path_tmp[0] = '\0';
+    if(p_hot_file_stat->mapping && p_hot_file_stat->mapping->host){
+        //内核大量使用 hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) 遍历inode->d_u.d_alias 链表上的dentry，这里要优化下!!!!!!!!!!!!!
+	dentry = hlist_entry(p_hot_file_stat->mapping->host->i_dentry.first, struct dentry, d_u.d_alias);
+        while(dentry && strcmp(dentry->d_iname,"/") != 0){
+	    name_len += strlen(dentry->d_iname);
+	    if(name_len > MAX_FILE_NAME_LEN - 2)
+		break;
+            
+	    if(file_name_path[0] != '\0')
+	        strcpy(file_name_path_tmp,file_name_path);
+	    sprintf(file_name_path,"/%s",dentry->d_iname);
+	    if(file_name_path_tmp[0] != '\0')
+	        strcat(file_name_path,file_name_path_tmp);
+
+	    dentry = dentry->d_parent;//父目录
+	}
+    }
+}
 //遍历p_hot_file_global各个链表上的file_stat的file_area个数及page个数
 int hot_file_print_all_file_stat(struct hot_file_global *p_hot_file_global)
 {
     struct hot_file_stat * p_hot_file_stat;
-
+    unsigned int file_stat_one_file_area_count = 0,file_stat_many_file_area_count = 0;
+    unsigned int file_stat_one_file_area_pages = 0;
+    char file_name_path[MAX_FILE_NAME_LEN];
+	
     //hot_file_global->hot_file_head链表
     if(!list_empty(&p_hot_file_global->hot_file_head))
     printk("hot_file_global->hot_file_head list********\n");
     list_for_each_entry_rcu(p_hot_file_stat,&p_hot_file_global->hot_file_head,hot_file_list){
-	if(p_hot_file_stat->file_area_count > 1)
-            printk("hot_file_stat:0x%llx file_area_count:%d nrpages:%ld\n",(u64)p_hot_file_stat,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages);
+	if(p_hot_file_stat->file_area_count > 1){
+	    file_stat_many_file_area_count ++;
+	    get_file_name(file_name_path,p_hot_file_stat);
+
+            printk("hot_file_stat:0x%llx max_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_hot_file_stat,p_hot_file_stat->max_file_area_age,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages,file_name_path);
+	}
+	else{
+	    file_stat_one_file_area_count ++;
+	    file_stat_one_file_area_pages += p_hot_file_stat->mapping->nrpages;
+	}
     }
 
     //hot_file_global->hot_file_head_temp链表
     if(!list_empty(&p_hot_file_global->hot_file_head_temp))
     printk("hot_file_global->hot_file_head_temp list********\n");
     list_for_each_entry_rcu(p_hot_file_stat,&p_hot_file_global->hot_file_head_temp,hot_file_list){
-	if(p_hot_file_stat->file_area_count > 1)
-            printk("hot_file_stat:0x%llx file_area_count:%d nrpages:%ld\n",(u64)p_hot_file_stat,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages);
+	if(p_hot_file_stat->file_area_count > 1){
+	    file_stat_many_file_area_count ++;
+	    get_file_name(file_name_path,p_hot_file_stat);
+
+            printk("hot_file_stat:0x%llx max_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_hot_file_stat,p_hot_file_stat->max_file_area_age,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages,file_name_path);
+	}
+	else{
+	    file_stat_one_file_area_count ++;
+	    file_stat_one_file_area_pages += p_hot_file_stat->mapping->nrpages;
+	}
     }
+
 
     //hot_file_global->hot_file_head_temp_large链表
     if(!list_empty(&p_hot_file_global->hot_file_head_temp_large))
         printk("hot_file_global->hot_file_head_temp_large list********\n");
     list_for_each_entry_rcu(p_hot_file_stat,&p_hot_file_global->hot_file_head_temp_large,hot_file_list){
-	if(p_hot_file_stat->file_area_count > 1)
-            printk("hot_file_stat:0x%llx file_area_count:%d nrpages:%ld\n",(u64)p_hot_file_stat,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages);
+	if(p_hot_file_stat->file_area_count > 1){
+	    file_stat_many_file_area_count ++;
+	    get_file_name(file_name_path,p_hot_file_stat);
+
+            printk("hot_file_stat:0x%llx max_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_hot_file_stat,p_hot_file_stat->max_file_area_age,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages,file_name_path);
+	}
+	else{
+	    file_stat_one_file_area_count ++;
+	    file_stat_one_file_area_pages += p_hot_file_stat->mapping->nrpages;
+	}
     }
 
+    printk("file_stat_one_file_area_count:%d pages:%d  file_stat_many_file_area_count:%d\n",file_stat_one_file_area_count,file_stat_one_file_area_pages,file_stat_many_file_area_count);
     return 0;
 }
 
@@ -3624,10 +3687,6 @@ int walk_throuth_all_hot_file_area(struct hot_file_global *p_hot_file_global)
 
         del_file_area_count += hot_file_tree_delete_all(p_hot_file_global,p_hot_file_stat);
 	del_file_stat_count ++;
-
-        spin_lock_irq(&p_hot_file_global->hot_file_lock);
-	list_del(&p_hot_file_stat->hot_file_list);
-        spin_unlock_irq(&p_hot_file_global->hot_file_lock);
     }
 
     //打印所有file_stat的file_area个数和page个数
