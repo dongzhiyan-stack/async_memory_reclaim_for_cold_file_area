@@ -150,6 +150,7 @@ struct hot_file_stat
     //unsigned int old_file_area_count_in_cold_list;
     //file_stat里age最大的file_area的age
     unsigned long max_file_area_age;
+    unsigned long recent_access_age;
 };
 struct hot_file_node_pgdat
 {
@@ -1471,7 +1472,7 @@ static unsigned long hot_file_isolate_lru_pages(struct hot_file_global *p_hot_fi
     //这里要用list_for_each_entry_safe()，不能用list_for_each_entry!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     list_for_each_entry_safe(p_hot_file_area,tmp_hot_file_area,hot_file_area_free,hot_file_area_list){
 	//如果在遍历file_stat的file_area过程，__destroy_inode_handler_post()里释放该file_stat对应的inode和mapping，则对file_stat加锁前先p_hot_file_stat->mapping =NULL，
-	//然后这里立即goto err并释放file_stat锁
+	//然后这里立即goto err并释放file_stat锁，最后__destroy_inode_handler_post()可以立即获取file_stat锁
         if(NULL == p_hot_file_stat->mapping)
             goto err;
 
@@ -3028,7 +3029,7 @@ static void get_file_name(char *file_name_path,struct hot_file_stat * p_hot_file
     file_name_path_tmp[0] = '\0';
     //必须 hlist_empty()判断文件inode是否有dentry，没有则返回true
     //这里必须增加inode和dentry的应用计数，然后才能放心使用，不用担心使用时inode和dentry释放了 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    if(p_hot_file_stat->mapping && p_hot_file_stat->mapping->host && hlist_empty(&p_hot_file_stat->mapping->host->i_dentry)){
+    if(p_hot_file_stat->mapping && p_hot_file_stat->mapping->host && !hlist_empty(&p_hot_file_stat->mapping->host->i_dentry)){
         //内核大量使用 hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) 遍历inode->d_u.d_alias 链表上的dentry，这里要优化下!!!!!!!!!!!!!
 	dentry = hlist_entry(p_hot_file_stat->mapping->host->i_dentry.first, struct dentry, d_u.d_alias);
         while(dentry && strcmp(dentry->d_iname,"/") != 0){
@@ -3073,7 +3074,7 @@ int hot_file_print_all_file_stat(struct hot_file_global *p_hot_file_global)
 		file_stat_many_file_area_count ++;
 		get_file_name(file_name_path,p_hot_file_stat);
 
-		printk("hot_file_stat:0x%llx max_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_hot_file_stat,p_hot_file_stat->max_file_area_age,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages,file_name_path);
+		printk("hot_file_stat:0x%llx max_age:%ld recent_access_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_hot_file_stat,p_hot_file_stat->max_file_area_age,p_hot_file_stat->recent_access_age,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages,file_name_path);
 	    }
 	    else{
 		file_stat_one_file_area_count ++;
@@ -3105,7 +3106,7 @@ int hot_file_print_all_file_stat(struct hot_file_global *p_hot_file_global)
 		file_stat_many_file_area_count ++;
 		get_file_name(file_name_path,p_hot_file_stat);
 
-		printk("hot_file_stat:0x%llx max_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_hot_file_stat,p_hot_file_stat->max_file_area_age,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages,file_name_path);
+		printk("hot_file_stat:0x%llx max_age:%ld recent_access_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_hot_file_stat,p_hot_file_stat->max_file_area_age,p_hot_file_stat->recent_access_age,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages,file_name_path);
 	    }
 	    else{
 		file_stat_one_file_area_count ++;
@@ -3137,7 +3138,7 @@ int hot_file_print_all_file_stat(struct hot_file_global *p_hot_file_global)
 		file_stat_many_file_area_count ++;
 		get_file_name(file_name_path,p_hot_file_stat);
 
-		printk("hot_file_stat:0x%llx max_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_hot_file_stat,p_hot_file_stat->max_file_area_age,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages,file_name_path);
+		printk("hot_file_stat:0x%llx max_age:%ld recent_access_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_hot_file_stat,p_hot_file_stat->max_file_area_age,p_hot_file_stat->recent_access_age,p_hot_file_stat->file_area_count,p_hot_file_stat->mapping->nrpages,file_name_path);
 	    }
 	    else{
 		file_stat_one_file_area_count ++;
@@ -3208,6 +3209,8 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_file_global *p_
 	    list_move_tail(&p_hot_file_stat->hot_file_list,&p_hot_file_global->hot_file_head_temp);
 	    continue;
 	}
+        if(p_hot_file_stat->recent_access_age < p_hot_file_global->global_age)
+	    p_hot_file_stat->recent_access_age = p_hot_file_global->global_age;
 
 	//需要设置这些hot_file_stat不再处于hot_file_head_temp链表，否则之后hot_file_update_file_status()会因该file_stat的热file_area很多而移动到global hot_file_head_temp链表
 	clear_file_stat_in_hot_file_head_temp_list(p_hot_file_stat);
