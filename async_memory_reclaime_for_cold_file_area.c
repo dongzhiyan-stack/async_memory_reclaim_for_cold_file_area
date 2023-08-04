@@ -49,12 +49,58 @@
 #include <linux/version.h>
 #include <linux/mm_inline.h>
 
-int open_shrink_printk = 1;
+int open_shrink_printk = 0;
 int open_shrink_printk1 = 0;
 unsigned long hot_file_shrink_enable = 1;
 void inline update_async_shrink_page(struct page *page);
 int hot_file_init(void);
 /***************************************************************/
+struct hot_file_shrink_counter
+{
+    /**get_file_area_from_file_stat_list()函数******/
+    //扫描的file_area个数
+    unsigned int scan_file_area_count;
+    //扫描的file_stat个数
+    unsigned int scan_file_stat_count;
+    //扫描到的处于delete状态的file_stat个数
+    unsigned int scan_delete_file_stat_count;
+    //扫描的冷file_stat个数
+    unsigned int scan_cold_file_area_count;
+    //扫描到的大文件转小文件的个数
+    unsigned int scan_large_to_small_count;
+    //本次扫描到但没有冷file_area的file_stat个数
+    unsigned int scan_fail_file_stat_count;
+
+    /**free_page_from_file_area()函数******/
+    //释放的page个数
+    unsigned int free_pages;
+    //隔离的page个数
+    unsigned int isolate_lru_pages;
+    //file_stat的refault链表转移到temp链表的file_area个数
+    unsigned int file_area_refault_to_temp_list_count;
+    //释放的file_area结构个数
+    unsigned int file_area_free_count;
+    //file_stat的hot链表转移到temp链表的file_area个数
+    unsigned int file_area_hot_to_temp_list_count;
+    
+    /**free_page_from_file_area()函数******/
+    //file_stat的hot链表转移到temp链表的file_area个数
+    unsigned int file_area_hot_to_temp_list_count2;
+    //释放的file_stat个数
+    unsigned int del_file_stat_count;
+    //释放的file_area个数
+    unsigned int del_file_area_count;
+
+    /**async_shrink_free_page()函数******/
+    unsigned int lock_fail_count;
+    unsigned int writeback_count;
+    unsigned int dirty_count;
+    unsigned int page_has_private_count;
+    unsigned int mapping_count;
+    unsigned int free_pages_count;
+    unsigned int free_pages_fail_count;
+};
+
 //最大文件名字长度
 #define MAX_FILE_NAME_LEN 100
 
@@ -186,7 +232,9 @@ struct hot_file_global
     int node_count;
     atomic_t   ref_count;
     atomic_t   inode_del_count;
+    struct hot_file_shrink_counter hot_file_shrink_counter;
 };
+
 static struct kprobe kp_kallsyms_lookup_name = {
     .symbol_name    = "kallsyms_lookup_name",
 };
@@ -566,6 +614,13 @@ static unsigned int async_shrink_free_page(struct pglist_data *pgdat,struct lruv
     unsigned nr_ref_keep = 0;
     unsigned nr_unmap_fail = 0;
 
+    unsigned int lock_fail_count = 0;
+    unsigned int writeback_count = 0;
+    unsigned int dirty_count = 0;
+    unsigned int page_has_private_count = 0;
+    unsigned int mapping_count = 0;
+    unsigned int free_pages_fail_count = 0;
+
     while (!list_empty(page_list)) {
         struct address_space *mapping;
         struct page *page;
@@ -576,14 +631,18 @@ static unsigned int async_shrink_free_page(struct pglist_data *pgdat,struct lruv
 	page = lru_to_page(page_list);
 	list_del(&page->lru);
 
-	if (!trylock_page(page))
+	if (!trylock_page(page)){
+	    lock_fail_count ++;
 	    goto keep;
+	}
 
         mapping = page_mapping(page);
         may_enter_fs = (sc->gfp_mask & __GFP_FS);
 
 	/****page是witeback页*********************/
 	if (PageWriteback(page)) {
+	    writeback_count ++;
+
     	    if(!PageReclaim(page)){
 	        SetPageReclaim(page);
 		nr_writeback += 1;
@@ -594,6 +653,8 @@ static unsigned int async_shrink_free_page(struct pglist_data *pgdat,struct lruv
 
 	/****page是脏页*********************/
 	if (PageDirty(page)) {
+	        dirty_count ++;
+
                 nr_dirty++;
                 goto activate_locked;	       
 		//这里goto keep 分支，忘了unlock_page()了，导致其他进程访问到该page时因为page lock就休眠了
@@ -602,6 +663,8 @@ static unsigned int async_shrink_free_page(struct pglist_data *pgdat,struct lruv
 
 	/*******释放page的bh******************/
 	if (page_has_private(page)) {
+	        page_has_private_count ++;
+
 		if(open_shrink_printk)
 		    printk("17:%s %s %d page:0x%llx page->flags:0x%lx mapping:0x%llx page_has_private\n",__func__,current->comm,current->pid,(u64)page,page->flags,(u64)mapping);
 
@@ -628,6 +691,8 @@ static unsigned int async_shrink_free_page(struct pglist_data *pgdat,struct lruv
 	}
         /********把page从radix tree剔除************************/
         if (!mapping || !__remove_mapping_async(mapping, page, true)){
+	    mapping_count ++;
+
             if(open_shrink_printk)
             printk("19:%s %s %d page:0x%llx page->flags:0x%lx mapping:0x%llx keep_locked\n",__func__,current->comm,current->pid,(u64)page,page->flags,(u64)mapping);
 	    goto keep_locked;
@@ -651,6 +716,7 @@ keep_locked:
 	unlock_page(page);
 keep:
         list_add(&page->lru, &ret_pages);
+	free_pages_fail_count ++;
     }
     mem_cgroup_uncharge_list_async(&free_pages);
     try_to_unmap_flush_async();
@@ -671,6 +737,15 @@ keep:
 	stat->nr_ref_keep = nr_ref_keep;
 	stat->nr_unmap_fail = nr_unmap_fail;
     }
+    hot_file_global_info.hot_file_shrink_counter.lock_fail_count = lock_fail_count;
+    hot_file_global_info.hot_file_shrink_counter.lock_fail_count = lock_fail_count;
+    hot_file_global_info.hot_file_shrink_counter.writeback_count = writeback_count;
+    hot_file_global_info.hot_file_shrink_counter.dirty_count = dirty_count;
+    hot_file_global_info.hot_file_shrink_counter.page_has_private_count = page_has_private_count;
+    hot_file_global_info.hot_file_shrink_counter.mapping_count = mapping_count;
+    hot_file_global_info.hot_file_shrink_counter.free_pages_count = nr_reclaimed;
+    hot_file_global_info.hot_file_shrink_counter.free_pages_fail_count = free_pages_fail_count;
+
     return nr_reclaimed;
 }
 /*
@@ -1041,6 +1116,14 @@ static unsigned int async_shrink_free_page(struct pglist_data *pgdat,struct lruv
     #endif
 	unsigned int nr_reclaimed = 0;
 	unsigned int pgactivate = 0;
+    
+	unsigned int lock_fail_count = 0;
+	unsigned int writeback_count = 0;
+	unsigned int dirty_count = 0;
+	unsigned int page_has_private_count = 0;
+	unsigned int mapping_count = 0;
+	unsigned int free_pages_fail_count = 0;
+
 
 	memset(stat, 0, sizeof(*stat));
 	cond_resched();
@@ -1065,6 +1148,8 @@ retry:
 		page = &folio->page;
                 
 		if (!trylock_page(page)){
+		    lock_fail_count ++;
+
                     if(open_shrink_printk)
 		        printk("1:%s %s %d page:0x%llx page->flags:0x%lx trylock_page(page)\n",__func__,current->comm,current->pid,(u64)page,page->flags);
 		    goto keep;
@@ -1110,6 +1195,8 @@ retry:
 
                 //遇到writebak页，不做任何处理，等脏页回写进程把它落盘。然后等几分钟后变成冷page，就会被异步回收掉。我的回收策略是只回收长时间不被冷page，这种page刚被访问过
 		if (PageWriteback(page)) {
+		        writeback_count ++;
+
                         if(open_shrink_printk)
 		            printk("2:%s %s %d page:0x%llx page->flags:0x%lx PageWriteback\n",__func__,current->comm,current->pid,(u64)page,page->flags);
 			if(PageReclaim(page)){
@@ -1149,6 +1236,8 @@ retry:
 		}
                 //遇到脏页，不做任何处理，等脏页回写进程把它落盘。然后等几分钟后变成冷page，就会被异步回收掉。我的回收策略是只回收长时间不被冷page，这种page刚被访问过
 		if (PageDirty(page)) {
+		    dirty_count ++;
+
                     if(open_shrink_printk)
 		        printk("3:%s %s %d page:0x%llx page->flags:0x%lx PageDirtyn",__func__,current->comm,current->pid,(u64)page,page->flags);
 		    goto activate_locked;
@@ -1157,6 +1246,8 @@ retry:
 		}
 
 		if (page_has_private(page)) {
+		        page_has_private_count ++;
+
 			if (!try_to_release_page(page, sc->gfp_mask)){
                                if(open_shrink_printk)
 		                   printk("4:%s %s %d page:0x%llx page->flags:0x%lx try_to_release_page\n",__func__,current->comm,current->pid,(u64)page,page->flags);
@@ -1183,6 +1274,7 @@ retry:
 		if (!mapping || !__remove_mapping_async(mapping, folio, true,
 							 folio_memcg(folio)))
 		{
+		    mapping_count ++;
                     if(open_shrink_printk)
 		        printk("5:%s %s %d page:0x%llx page->flags:0x%lx __remove_mapping\n",__func__,current->comm,current->pid,(u64)page,page->flags);
 
@@ -1235,6 +1327,7 @@ keep_locked:
 keep:
 		list_add(&page->lru, &ret_pages);
 		VM_BUG_ON_PAGE(PageLRU(page) || PageUnevictable(page), page);
+		free_pages_fail_count ++;
 	}
 	/* 'page_list' is always empty here */
     #if 0 
@@ -1257,6 +1350,15 @@ keep:
 
 	list_splice(&ret_pages, page_list);
 	count_vm_events(PGACTIVATE, pgactivate);
+
+	hot_file_global_info.hot_file_shrink_counter.lock_fail_count = lock_fail_count;
+	hot_file_global_info.hot_file_shrink_counter.lock_fail_count = lock_fail_count;
+	hot_file_global_info.hot_file_shrink_counter.writeback_count = writeback_count;
+	hot_file_global_info.hot_file_shrink_counter.dirty_count = dirty_count;
+	hot_file_global_info.hot_file_shrink_counter.page_has_private_count = page_has_private_count;
+	hot_file_global_info.hot_file_shrink_counter.mapping_count = mapping_count;
+	hot_file_global_info.hot_file_shrink_counter.free_pages_count = nr_reclaimed;
+	hot_file_global_info.hot_file_shrink_counter.free_pages_fail_count = free_pages_fail_count;
 
 	return nr_reclaimed;
 }
@@ -3171,7 +3273,11 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_file_global *p_
 
     unsigned int scan_file_area_count  = 0;
     unsigned int scan_file_stat_count  = 0;
+    unsigned int scan_delete_file_stat_count = 0;
     unsigned int scan_cold_file_area_count = 0;
+    unsigned int scan_large_to_small_count = 0;
+    unsigned int scan_fail_file_stat_count = 0;
+
     unsigned int cold_file_area_for_file_stat = 0;
     unsigned int file_stat_count_in_cold_list = 0;
     unsigned int serial_hot_file_area = 0;
@@ -3189,6 +3295,7 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_file_global *p_
 	if(!file_stat_in_hot_file_head_temp_list(p_hot_file_stat))
 	    panic("%s file_stat:0x%llx not int hot_file_head_temp status:0x%lx\n",__func__,(u64)p_hot_file_stat,p_hot_file_stat->file_stat_status);
         else if(file_stat_in_delete(p_hot_file_stat)){
+	        scan_delete_file_stat_count ++;
 		//如果该文件inode被释放了，则把对应file_stat移动到hot_file_global->hot_file_head_delete链表
 		list_move(&p_hot_file_stat->hot_file_list,&p_hot_file_global->hot_file_head_delete);
 		continue;
@@ -3203,6 +3310,7 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_file_global *p_
 	    if(open_shrink_printk)
 	        printk("1:%s %s %d p_hot_file_global:0x%llx p_hot_file_stat:0x%llx status:0x%lx not is_file_stat_large_file\n",__func__,current->comm,current->pid,(u64)p_hot_file_global,(u64)p_hot_file_stat,p_hot_file_stat->file_stat_status);
 
+	    scan_large_to_small_count ++;
             clear_file_stat_in_large_file(p_hot_file_stat);
 	    //不用现在把file_stat移动到global hot_file_head_temp链表。等该file_stat的file_area经过内存回收后，该file_stat会因为clear_file_stat_in_large_file而移动到hot_file_head_temp链表
 	    //想了想，还是现在就移动到file_stat->hot_file_head_temp链表尾，否则内存回收再移动更麻烦。要移动到链表尾，这样紧接着就会从hot_file_head_temp链表链表尾扫描到该file_stat
@@ -3364,8 +3472,10 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_file_global *p_
 
         spin_lock_irq(&p_hot_file_global->hot_file_lock);
 	//设置file_stat状态要加锁
-	list_for_each_entry(p_hot_file_stat,&global_hot_file_head_temp_list,hot_file_list)
+	list_for_each_entry(p_hot_file_stat,&global_hot_file_head_temp_list,hot_file_list){
 	    set_file_stat_in_hot_file_head_temp_list(p_hot_file_stat);//设置hot_file_stat状态为head_temp_list 
+	    scan_fail_file_stat_count ++;
+	}
 	//set_file_stat_in_head_temp_list(p_hot_file_stat);//不用再设置这些hot_file_stat的状态，这些hot_file_stat没有移动到global hot_file_area_cold链表，没改变状态
         //list_splice(&global_hot_file_head_temp_list,&p_hot_file_global->hot_file_head_temp);//移动到global hot_file_head_temp链表头
         //list_splice_tail(&global_hot_file_head_temp_list,&p_hot_file_global->hot_file_head_temp);//移动到 global hot_file_head_temp链表尾
@@ -3384,6 +3494,19 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_file_global *p_
     if(open_shrink_printk)
         printk("3:%s %s %d p_hot_file_global:0x%llx scan_file_stat_count:%d scan_file_area_count:%d scan_cold_file_area_count:%d file_stat_count_in_cold_list:%d\n",__func__,current->comm,current->pid,(u64)p_hot_file_global,scan_file_stat_count,scan_file_area_count,scan_cold_file_area_count,file_stat_count_in_cold_list);
 
+    //扫描的file_area个数
+    p_hot_file_global->hot_file_shrink_counter.scan_file_area_count = scan_file_area_count;
+    //扫描的file_stat个数
+    p_hot_file_global->hot_file_shrink_counter.scan_file_stat_count = scan_file_stat_count;
+    //扫描到的处于delete状态的file_stat个数
+    p_hot_file_global->hot_file_shrink_counter.scan_delete_file_stat_count = scan_delete_file_stat_count;
+    //扫描的冷file_stat个数
+    p_hot_file_global->hot_file_shrink_counter.scan_cold_file_area_count = scan_cold_file_area_count;
+    //扫描到的大文件转小文件的个数
+    p_hot_file_global->hot_file_shrink_counter.scan_large_to_small_count = scan_large_to_small_count;
+    //本次扫描到但没有冷file_area的file_stat个数
+    p_hot_file_global->hot_file_shrink_counter.scan_fail_file_stat_count = scan_fail_file_stat_count;
+
     return scan_cold_file_area_count;
 }
 /*该函数主要有3个作用
@@ -3398,10 +3521,10 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_file_global *p_
 //hot_file_head_temp是global hot_file_head_temp或hot_file_head_temp_large
 unsigned long free_page_from_file_area(struct hot_file_global *p_hot_file_global,struct list_head * file_stat_free_list,struct list_head *hot_file_head_temp)
 {
-    unsigned int free_pages = 0;
     struct hot_file_stat * p_hot_file_stat/*,*p_hot_file_stat_temp*/;
     struct hot_file_area *p_hot_file_area,*p_hot_file_area_temp;
     unsigned int cold_file_area_count;
+    unsigned int free_pages = 0;
     unsigned int hot_file_area_count;
     unsigned int isolate_lru_pages = 0;
     unsigned int file_area_refault_to_temp_list_count = 0;
@@ -3421,8 +3544,8 @@ unsigned long free_page_from_file_area(struct hot_file_global *p_hot_file_global
 	//这里真正释放p_hot_file_global->hot_file_node_pgdat->pgdat_page_list链表上的内存page
 	free_pages += hot_file_shrink_pages(p_hot_file_global);
 	
-	if(open_shrink_printk)
-	    printk("1:%s %s %d p_hot_file_global:0x%llx p_hot_file_stat:0x%llx status:0x%lx free_pages:%d\n",__func__,current->comm,current->pid,(u64)p_hot_file_global,(u64)p_hot_file_stat,p_hot_file_stat->file_stat_status,free_pages);
+	
+	printk("1:%s %s %d p_hot_file_global:0x%llx p_hot_file_stat:0x%llx status:0x%lx free_pages:%d\n",__func__,current->comm,current->pid,(u64)p_hot_file_global,(u64)p_hot_file_stat,p_hot_file_stat->file_stat_status,free_pages);
    
         /*注意，hot_file_stat->hot_file_area_free_temp 和 hot_file_stat->hot_file_area_free 各有用处。hot_file_area_free_temp保存每次扫描释放的page的hot_file_area。
 	  释放后把这些hot_file_area移动到hot_file_area_free链表，hot_file_area_free保存的是每轮扫描释放page的所有hot_file_area，是所有的!!!!!!!!!!!!!!*/
@@ -3621,10 +3744,29 @@ unsigned long free_page_from_file_area(struct hot_file_global *p_hot_file_global
 	INIT_LIST_HEAD(file_stat_free_list);
 	spin_unlock_irq(&p_hot_file_global->hot_file_lock);
     }
-    
+   
+    //释放的page个数
+    p_hot_file_global->hot_file_shrink_counter.free_pages = free_pages;
+    //隔离的page个数
+    p_hot_file_global->hot_file_shrink_counter.isolate_lru_pages = isolate_lru_pages;
+    //file_stat的refault链表转移到temp链表的file_area个数
+    p_hot_file_global->hot_file_shrink_counter.file_area_refault_to_temp_list_count = file_area_refault_to_temp_list_count;
+    //释放的file_area结构个数
+    p_hot_file_global->hot_file_shrink_counter.file_area_free_count = file_area_free_count;
+    //file_stat的hot链表转移到temp链表的file_area个数
+    p_hot_file_global->hot_file_shrink_counter.file_area_hot_to_temp_list_count = file_area_hot_to_temp_list_count;
+
     if(open_shrink_printk)
     	printk("5:%s %s %d p_hot_file_global:0x%llx free_pages:%d isolate_lru_pages:%d hot_file_head_temp:0x%llx file_area_free_count:%d file_area_refault_to_list_temp_count:%d file_area_hot_to_temp_list_count:%d\n",__func__,current->comm,current->pid,(u64)p_hot_file_global,free_pages,isolate_lru_pages,(u64)hot_file_head_temp,file_area_free_count,file_area_refault_to_temp_list_count,file_area_hot_to_temp_list_count);
     return free_pages;
+}
+static void printk_shrink_param(struct hot_file_global *p_hot_file_global)
+{
+    struct hot_file_shrink_counter *p = &p_hot_file_global->hot_file_shrink_counter;
+
+    printk("scan_file_area_count:0x%d scan_file_stat_count:0x%d scan_delete_file_stat_count:0x%d scan_cold_file_area_count:0x%d scan_large_to_small_count:0x%d scan_fail_file_stat_count:0x%d file_area_refault_to_temp_list_count:0x%d file_area_free_count:0x%d file_area_hot_to_temp_list_count:0x%d---0x%d\n",p->scan_file_area_count,p->scan_file_stat_count,p->scan_delete_file_stat_count,p->scan_cold_file_area_count,p->scan_large_to_small_count,p->scan_fail_file_stat_count,p->file_area_refault_to_temp_list_count,p->file_area_free_count,p->file_area_hot_to_temp_list_count,p->file_area_hot_to_temp_list_count2);
+
+    printk("isolate_lru_pages:0x%d del_file_stat_count:0x%d del_file_area_count:%d lock_fail_count:%d writeback_count:%d dirty_count:%d page_has_private_count:%d mapping_count:%d free_pages_count:%d free_pages_fail_count:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count);
 }
 int walk_throuth_all_hot_file_area(struct hot_file_global *p_hot_file_global)
 {
@@ -3641,6 +3783,8 @@ int walk_throuth_all_hot_file_area(struct hot_file_global *p_hot_file_global)
     unsigned int del_file_stat_count = 0,del_file_area_count = 0;
     //每个周期global_age加1
     hot_file_global_info.global_age ++;
+
+    memset(&p_hot_file_global->hot_file_shrink_counter,0,sizeof(struct hot_file_shrink_counter));
 
     scan_file_stat_max = 10;
     scan_file_area_max = 1024;
@@ -3794,11 +3938,20 @@ int walk_throuth_all_hot_file_area(struct hot_file_global *p_hot_file_global)
         del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
 	del_file_stat_count ++;
     }
+    //file_stat的hot链表转移到temp链表的file_area个数
+    p_hot_file_global->hot_file_shrink_counter.file_area_hot_to_temp_list_count2 = file_area_hot_to_temp_list_count;
+    //释放的file_area个数
+    p_hot_file_global->hot_file_shrink_counter.del_file_area_count = del_file_area_count;
+    //释放的file_stat个数
+    p_hot_file_global->hot_file_shrink_counter.del_file_stat_count = del_file_stat_count;
 
     //打印所有file_stat的file_area个数和page个数
     hot_file_print_all_file_stat(p_hot_file_global);
+    //打印内存回收时统计的各个参数
+    printk_shrink_param(p_hot_file_global);
 
-    printk(">>>>>global_age:%ld file_stat_count:%ld free_pages:%ld del_file_area_count:%d del_file_stat_count:%d scan_cold_file_area_count:%d<<<<<<\n",p_hot_file_global->global_age,p_hot_file_global->file_stat_count,nr_reclaimed,del_file_area_count,del_file_stat_count,scan_cold_file_area_count);
+    printk(">>>>>0x%llx global_age:%ld file_stat_count:%ld free_pages:%ld<<<<<<\n",(u64)p_hot_file_global,p_hot_file_global->global_age,p_hot_file_global->file_stat_count,nr_reclaimed);
+
     return 0;
 }
 //卸载该驱动时，先hot_file_shrink_enable=0，确保所有的file_stat和file_area不再被进程访问后。就会执行该函数删除掉所有文件对应的file_stat，同时要把file_stat->mapping->rh_reserved1清0，
@@ -3838,11 +3991,11 @@ int hot_file_delete_all_file_stat(struct hot_file_global *p_hot_file_global)
 
     //hot_file_global->hot_file_head_delete链表
     list_for_each_entry_safe_reverse(p_hot_file_stat,p_hot_file_stat_temp,&p_hot_file_global->hot_file_head_delete,hot_file_list){
-        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
-	del_file_stat_count ++;
 	//标记 p_hot_file_stat->mapping->rh_reserved1=0，表示该文件的file_stat已经释放了。否则，mapping->rh_reserved1保存的file_stat指针一直存在，等下次该文件
 	//再被访问执行hot_file_update_file_status(),就会因为mapping->rh_reserved1非0，导致错误以为改文件的file_stat已经分配了，然后使用这个file_stat无效的导致crash
 	hot_file_disable_file_stat_mapping(p_hot_file_global,p_hot_file_stat);
+        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
+	del_file_stat_count ++;
     }
     printk("hot_file_global->hot_file_head_delete del_file_area_count:%d del_file_stat_count:%d\n",del_file_area_count,del_file_stat_count);
     del_file_area_count = 0;
@@ -3850,10 +4003,10 @@ int hot_file_delete_all_file_stat(struct hot_file_global *p_hot_file_global)
 
     //hot_file_global->hot_file_head链表
     list_for_each_entry_safe_reverse(p_hot_file_stat,p_hot_file_stat_temp,&p_hot_file_global->hot_file_head,hot_file_list){
-        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
-	del_file_stat_count ++;
 	//标记 p_hot_file_stat->mapping->rh_reserved1=0，表示该文件的file_stat已经释放了
 	hot_file_disable_file_stat_mapping(p_hot_file_global,p_hot_file_stat);
+        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
+	del_file_stat_count ++;
     }
     printk("hot_file_global->hot_file_head del_file_area_count:%d del_file_stat_count:%d\n",del_file_area_count,del_file_stat_count);
     del_file_area_count = 0;
@@ -3861,10 +4014,10 @@ int hot_file_delete_all_file_stat(struct hot_file_global *p_hot_file_global)
 
     //hot_file_global->hot_file_head_temp链表
     list_for_each_entry_safe_reverse(p_hot_file_stat,p_hot_file_stat_temp,&p_hot_file_global->hot_file_head_temp,hot_file_list){
-        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
-	del_file_stat_count ++;
 	//标记 p_hot_file_stat->mapping->rh_reserved1=0，表示该文件的file_stat已经释放了
 	hot_file_disable_file_stat_mapping(p_hot_file_global,p_hot_file_stat);
+        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
+	del_file_stat_count ++;
     }
     printk("hot_file_global->hot_file_head_temp del_file_area_count:%d del_file_stat_count:%d\n",del_file_area_count,del_file_stat_count);
     del_file_area_count = 0;
@@ -3872,10 +4025,10 @@ int hot_file_delete_all_file_stat(struct hot_file_global *p_hot_file_global)
 
     //hot_file_global->hot_file_head_temp_large链表
     list_for_each_entry_safe_reverse(p_hot_file_stat,p_hot_file_stat_temp,&p_hot_file_global->hot_file_head_temp_large,hot_file_list){
-        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
-	del_file_stat_count ++;
 	//标记 p_hot_file_stat->mapping->rh_reserved1=0，表示该文件的file_stat已经释放了
 	hot_file_disable_file_stat_mapping(p_hot_file_global,p_hot_file_stat);
+        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
+	del_file_stat_count ++;
     }
     printk("hot_file_global->hot_file_head_temp_large del_file_area_count:%d del_file_stat_count:%d\n",del_file_area_count,del_file_stat_count);
     del_file_area_count = 0;
@@ -3883,10 +4036,10 @@ int hot_file_delete_all_file_stat(struct hot_file_global *p_hot_file_global)
 
     //hot_file_global->cold_file_head链表
     list_for_each_entry_safe_reverse(p_hot_file_stat,p_hot_file_stat_temp,&p_hot_file_global->cold_file_head,hot_file_list){
-        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
-	del_file_stat_count ++;
 	//标记 p_hot_file_stat->mapping->rh_reserved1=0，表示该文件的file_stat已经释放了
 	hot_file_disable_file_stat_mapping(p_hot_file_global,p_hot_file_stat);
+        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
+	del_file_stat_count ++;
     }
     printk("hot_file_global->cold_file_head del_file_area_count:%d del_file_stat_count:%d\n",del_file_area_count,del_file_stat_count);
 
