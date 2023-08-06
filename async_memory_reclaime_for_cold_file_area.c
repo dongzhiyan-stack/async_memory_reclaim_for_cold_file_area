@@ -99,10 +99,15 @@ struct hot_file_shrink_counter
     unsigned int mapping_count;
     unsigned int free_pages_count;
     unsigned int free_pages_fail_count;
+
+    /**file_stat_has_zero_file_area_manage()函数****/
+    unsigned int scan_zero_file_area_file_stat_count;
 };
 
 //最大文件名字长度
 #define MAX_FILE_NAME_LEN 100
+//当一个文件file_stat长时间不被访问，释放掉了所有的file_area，再过FILE_STAT_DELETE_AGE_DX个周期，则释放掉file_stat结构
+#define FILE_STAT_DELETE_AGE_DX  2
 
 //一个 hot_file_area 包含的page数，默认6个
 #define PAGE_COUNT_IN_AREA_SHIFT 3
@@ -218,10 +223,13 @@ struct hot_file_global
 
     struct list_head cold_file_head;
     struct list_head hot_file_head_delete;
+    struct list_head hot_file_zero_file_area;//0个file_area的file_stat移动到这个链表
     //在cold_fiLe_head链表的file_stat个数
     //unsigned int file_stat_count_in_cold_list;
     unsigned int hot_file_stat_count;
-    unsigned long file_stat_count ;
+    unsigned int file_stat_count ;
+    unsigned int file_stat_count_zero_file_area;//0个file_area的file_stat个数
+
     unsigned long global_age;//每个周期加1
     struct kmem_cache *hot_file_stat_cachep;
     struct kmem_cache *hot_file_area_cachep;
@@ -242,7 +250,7 @@ static void kallsyms_lookup_name_handler_post(struct kprobe *p, struct pt_regs *
 	                unsigned long flags)
 {
 }
-
+static void inline hot_file_stat_delete(struct hot_file_global *p_hot_file_global,struct hot_file_stat * p_hot_file_stat_del);
 #if 0
 //返回1说明hot_file_area结构处于hot_file_area_temp链表，不冷不热
 static inline int file_area_in_temp_list(struct hot_file_area *p_hot_file_area)
@@ -407,6 +415,7 @@ static inline int file_stat_in_hot_file_head_temp_large(struct hot_file_stat *p_
 enum file_stat_status{
     F_file_stat_in_hot_file_head_list,
     F_file_stat_in_hot_file_head_temp_list,
+    F_file_stat_in_zero_file_area_list,
     F_file_stat_in_large_file,
     F_file_stat_in_delete,
     F_file_stat_lock,
@@ -436,7 +445,7 @@ static inline int file_stat_in_##name##_list(struct hot_file_stat *p_hot_file_st
 
 FILE_STAT_STATUS(hot_file_head)
 FILE_STAT_STATUS(hot_file_head_temp)
-//FILE_STAT_STATUS(large_file)
+FILE_STAT_STATUS(zero_file_area)
     
 //设置文件的状态，大小文件等
 #define CLEAR_FILE_STATUS(name)\
@@ -1573,7 +1582,7 @@ static unsigned long hot_file_isolate_lru_pages(struct hot_file_global *p_hot_fi
     //!!!!!!!!!!!!!!隐藏非常深的地方，这里遍历hot_file_area_free(即)链表上的file_area时，可能该file_area在hot_file_update_file_status()中被访问而移动到了temp链表
     //这里要用list_for_each_entry_safe()，不能用list_for_each_entry!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     list_for_each_entry_safe(p_hot_file_area,tmp_hot_file_area,hot_file_area_free,hot_file_area_list){
-	//如果在遍历file_stat的file_area过程，__destroy_inode_handler_post()里释放该file_stat对应的inode和mapping，则对file_stat加锁前先p_hot_file_stat->mapping =NULL，
+	//如果在遍历file_stat的file_area过程，__destroy_inode_handler_post()里释放该file_stat对应的inode和mapping，则对file_stat加锁前先p_hot_file_stat->mapping =NULL.
 	//然后这里立即goto err并释放file_stat锁，最后__destroy_inode_handler_post()可以立即获取file_stat锁
         if(NULL == p_hot_file_stat->mapping)
             goto err;
@@ -2384,6 +2393,59 @@ unsigned int hot_file_area_detele_quick(struct hot_file_global *p_hot_file_globa
 
     return 0;
 }
+//异步内存回收线程把file_stat从p_hot_file_global的链表中剔除，释放file_stat结构，释放前需要先lock_file_stat()防止其他进程并发访问file_stat
+static void inline hot_file_stat_delete(struct hot_file_global *p_hot_file_global,struct hot_file_stat * p_hot_file_stat_del)
+{
+
+    //差点就犯的超隐藏错误!!!!!!!!!!!!!!!!!!把hot_file_stat从hot_file_global的链表剔除，然后kmem_cache_free释放后，p_hot_file_stat_del->hot_file_list的next和prev
+    //就设置成LIST_POISON1/LIST_POISON2.之后能通过下边的if判断判定hot_file_stat是否已经从hot_file_global的链表剔除了吗？第一印象可以，但实际p_hot_file_stat_del->
+    //hot_file_list.next就会非法内存访问而crash，因为此时这file_stat结构体已经释放了，p_hot_file_stat_del->hot_file_list指向的这个结构体内存已经释放了，是无效内存!!!
+#if 0
+    if((p_hot_file_stat_del->hot_file_list.next == LIST_POISON1) || (p_hot_file_stat_del->hot_file_list.prev == LIST_POISON2)){
+         spin_unlock(&p_hot_file_global->hot_file_lock);
+         unlock_file_stat(p_hot_file_stat_del);
+         return;	 
+    }
+#else
+    //lock_file_stat加锁原因是:当异步内存回收线程在这里释放file_stat结构时，同一时间file_stat对应文件inode正在被释放而执行到__destroy_inode_handler_post()函数。
+    //如果这里把file_stat释放了，__destroy_inode_handler_post()使用file_stat就要crash。而lock_file_stat()防止这种情况。同时，__destroy_inode_handler_post()执行后会
+    //立即释放inode和mapping，然后此时这里要用到p_hot_file_stat->mapping->rh_reserved1，此时同样也会因file_stat已经释放而crash
+    lock_file_stat(p_hot_file_stat_del);
+    if(p_hot_file_stat_del->mapping){
+        //文件inode的mapping->rh_reserved1清0表示file_stat无效，这__destroy_inode_handler_post()删除inode时，发现inode的mapping->rh_reserved1是0就不再使用file_stat了，会crash
+        p_hot_file_stat_del->mapping->rh_reserved1 = 0;
+	p_hot_file_stat_del->mapping = NULL;
+    }
+    //下边的spin_unlock有内存屏障操作吗？算了，这里主动调用一下
+    smp_wmb();
+    unlock_file_stat(p_hot_file_stat_del);
+#endif
+
+    //如果有进程正在"hot_file_update_file_status()访问file_stat"，会用到file_stat，则这里先休眠等待它用完file_stat再释放file_stat，二者可能用的是同一个file_stat
+    while(atomic_read(&hot_file_global_info.ref_count)){
+        msleep(1);
+    }
+    //如果有进程正在"删除inode"，会用到file_stat，则这里先休眠等待它用完file_stat再释放file_stat，二者可能用的是同一个file_stat
+    while(atomic_read(&hot_file_global_info.inode_del_count)){
+        msleep(1);
+    }
+
+    //对hot_file_lock加锁是因为要把file_stat从p_hot_file_global的链表中剔除，防止此时其他进程并发向p_hot_file_global的链表添加file_stat
+    spin_lock(&p_hot_file_global->hot_file_lock);
+    //释放file_stat后，必须要把p_hot_file_stat->mapping清NULL
+    p_hot_file_stat_del->mapping = NULL;
+    //主动删除的file_stat也要标记delete，防止这个已经被释放file_stat在hot_file_update_file_status()里被再次使用，会因file_stat有delete标记而触发crash
+    set_file_stat_in_delete(p_hot_file_stat_del);
+    //从global的链表中剔除该file_stat，这个过程需要加锁，因为同时其他进程会执行hot_file_update_file_status()向global的链表添加新的文件file_stat
+    list_del(&p_hot_file_stat_del->hot_file_list);
+    //释放该file_stat结构
+    kmem_cache_free(p_hot_file_global->hot_file_stat_cachep,p_hot_file_stat_del);
+    //file_stat个数减1
+    hot_file_global_info.file_stat_count--;
+    spin_unlock(&p_hot_file_global->hot_file_lock);
+
+    printk("%s hot_file_stat:0x%llx delete !!!!!!!!!!!!!!!!\n",__func__,(u64)p_hot_file_stat_del);
+}
 //删除p_hot_file_stat_del对应文件的file_stat上所有的file_area，已经对应hot file tree的所有节点hot_file_area_tree_node结构。最后释放掉p_hot_file_stat_del这个hot_file_stat数据结构
 unsigned int hot_file_stat_delete_all_file_area(struct hot_file_global *p_hot_file_global,struct hot_file_stat * p_hot_file_stat_del)
 {
@@ -2435,14 +2497,8 @@ unsigned int hot_file_stat_delete_all_file_area(struct hot_file_global *p_hot_fi
         panic("hot_file_stat_del:0x%llx file_area_count:%d !=0 !!!!!!!!\n",(u64)p_hot_file_stat_del,p_hot_file_stat_del->file_area_count);
     }
 
-    spin_lock(&p_hot_file_global->hot_file_lock);
-    //从global的链表中剔除该file_stat，这个过程需要加锁，因为同时其他进程会执行hot_file_update_file_status()向global的链表添加新的文件file_stat
-    list_del(&p_hot_file_stat_del->hot_file_list);
-    //释放该file_stat结构
-    kmem_cache_free(p_hot_file_global->hot_file_stat_cachep,p_hot_file_stat_del);
-    //file_stat个数减1
-    hot_file_global_info.file_stat_count--;
-    spin_unlock(&p_hot_file_global->hot_file_lock);
+    //把file_stat从p_hot_file_global的链表中剔除，然后释放file_stat结构
+    hot_file_stat_delete(p_hot_file_global,p_hot_file_stat_del);
 
     return del_file_area_count;
 }
@@ -2589,6 +2645,11 @@ already_alloc:
 	        printk("%s p_hot_file_stat:0x%llx error or p_hot_file_stat->mapping != mapping\n",__func__,(u64)p_hot_file_stat);
 		goto err;
 	    }
+	    //如果当前正在使用的file_stat的inode已经释放了，主动触发crash 
+	    if(file_stat_in_delete(p_hot_file_stat)){
+	        panic("%s %s %d hot_file_stat:0x%llx status:0x%lx in delete\n",__func__,current->comm,current->pid,(u64)p_hot_file_stat,p_hot_file_stat->file_stat_status);
+	    }
+
 
             spin_lock_irq(&p_hot_file_stat->hot_file_stat_lock);
 	    //根据page索引的hot_file_area的索引，找到对应在file area tree树的槽位，page_slot_in_tree双重指针指向这个槽位。
@@ -2693,13 +2754,16 @@ already_alloc:
                 
 		//如果文件file_stat的file_area很多都是热的，判定file_stat是热文件，则把hot_file_stat移动到global hot_file_head链表，
 		//global hot_file_head链表上的hot_file_stat不再扫描上边的hot_file_area，有没有必要这样做??????????????????????
-		if(!file_stat_in_hot_file_head_list(p_hot_file_stat) && is_file_stat_hot_file(&hot_file_global_info,p_hot_file_stat)){
-		    if(!file_stat_in_hot_file_head_temp_list(p_hot_file_stat))
-		         panic("%s %s %d hot_file_stat:0x%llx status:0x%lx not in hot_file_head_temp_list\n",__func__,current->comm,current->pid,(u64)p_hot_file_stat,p_hot_file_stat->file_stat_status);
-		    //外层有spin_lock_irq(&p_hot_file_stat->hot_file_stat_lock)，这里不应该再关中断，只能spin_lock加锁!!!!!!!!!!!!!!
+		if(file_stat_in_hot_file_head_temp_list(p_hot_file_stat) && is_file_stat_hot_file(&hot_file_global_info,p_hot_file_stat)){
+		    //外层有spin_lock_irq(&p_hot_file_stat->hot_file_stat_lock)，这里不应该再关中断，只能spin_lock加锁
+		    //这个spin lock加锁可以移动到get_file_area_from_file_stat_list()函数开头遍历file_stat的for循环里，判断出热文件则把file_stat移动到
+		    //hot_file_global_info.hot_file_head链表，否则在这个函数，可能频繁spin lock加锁而导致性能损失!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
                     spin_lock(&hot_file_global_info.hot_file_lock);
+		    hot_file_global_info.hot_file_stat_count ++;//热文件数加1
 		    clear_file_stat_in_hot_file_head_temp_list(p_hot_file_stat);
+		    //设置file_stat处于热文件链表
 		    set_file_stat_in_hot_file_head_list(p_hot_file_stat);
+		    //把file_stat移动到热文件链表
 	            list_move(&p_hot_file_stat->hot_file_list,&hot_file_global_info.hot_file_head);
                     spin_unlock(&hot_file_global_info.hot_file_lock);
 		}
@@ -2753,7 +2817,7 @@ already_alloc:
 		    //设置file_stat是大文件
 		    set_file_stat_in_large_file(p_hot_file_stat);
 		    //如果file_stat已经被判定热文件而移动到了ot_file_global_info.hot_file_head链表，不再移动到hot_file_global_info.hot_file_head_temp_large链表。否则
-		    //这个file_stat深处hot_file_global_info.hot_file_head_temp_large链表，但是没有file_stat_in_hot_file_head_temp_list标记，将来遍历时会触发crash
+		    //这个file_stat处于hot_file_global_info.hot_file_head_temp_large链表，但是没有file_stat_in_hot_file_head_temp_list标记，将来遍历时会触发crash
 		    if(!file_stat_in_hot_file_head_list(p_hot_file_stat))
 	                list_move(&p_hot_file_stat->hot_file_list,&hot_file_global_info.hot_file_head_temp_large);
                     spin_unlock(&hot_file_global_info.hot_file_lock);
@@ -3300,7 +3364,15 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_file_global *p_
 		list_move(&p_hot_file_stat->hot_file_list,&p_hot_file_global->hot_file_head_delete);
 		continue;
 	}
-
+	//如果file_stat的file_area全被释放了，则把file_stat移动到hot_file_global->hot_file_zero_file_area链表
+	if(p_hot_file_stat->file_area_count == 0){
+	        set_file_stat_in_zero_file_area_list(p_hot_file_stat);
+	        p_hot_file_global->file_stat_count_zero_file_area ++;
+		//如果该文件inode被释放了，则把对应file_stat移动到hot_file_global->hot_file_zero_file_area链表
+		list_move(&p_hot_file_stat->hot_file_list,&p_hot_file_global->hot_file_zero_file_area);
+		continue;
+	}
+    
 	/*hot_file_head_temp来自 hot_file_global->hot_file_head_temp 或 hot_file_global->hot_file_head_temp_large 链表，当是hot_file_global->hot_file_head_temp_large
 	 * 时，file_stat_in_large_file(p_hot_file_stat)才会成立*/
 
@@ -3766,7 +3838,67 @@ static void printk_shrink_param(struct hot_file_global *p_hot_file_global)
 
     printk("scan_file_area_count:0x%d scan_file_stat_count:0x%d scan_delete_file_stat_count:0x%d scan_cold_file_area_count:0x%d scan_large_to_small_count:0x%d scan_fail_file_stat_count:0x%d file_area_refault_to_temp_list_count:0x%d file_area_free_count:0x%d file_area_hot_to_temp_list_count:0x%d---0x%d\n",p->scan_file_area_count,p->scan_file_stat_count,p->scan_delete_file_stat_count,p->scan_cold_file_area_count,p->scan_large_to_small_count,p->scan_fail_file_stat_count,p->file_area_refault_to_temp_list_count,p->file_area_free_count,p->file_area_hot_to_temp_list_count,p->file_area_hot_to_temp_list_count2);
 
-    printk("isolate_lru_pages:0x%d del_file_stat_count:0x%d del_file_area_count:%d lock_fail_count:%d writeback_count:%d dirty_count:%d page_has_private_count:%d mapping_count:%d free_pages_count:%d free_pages_fail_count:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count);
+    printk("isolate_lru_pages:0x%d del_file_stat_count:0x%d del_file_area_count:%d lock_fail_count:%d writeback_count:%d dirty_count:%d page_has_private_count:%d mapping_count:%d free_pages_count:%d free_pages_fail_count:%d scan_zero_file_area_file_stat_count:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count,p->scan_zero_file_area_file_stat_count);
+}
+/*
+ *遍历global hot_file_zero_file_area链表上的file_stat，如果file_stat对应文件长时间不被访问杂释放掉file_stat。如果file_stat对应文件又被访问了，则把file_stat再移动回 gloabl hot_file_head_temp、hot_file_head_temp_large、hot_file_head链表
+ * */
+static void file_stat_has_zero_file_area_manage(struct hot_file_global *p_hot_file_global)
+{
+    struct hot_file_stat * p_hot_file_stat,*p_hot_file_stat_temp;
+    unsigned int scan_file_stat_max = 128,scan_file_stat_count = 0;
+    unsigned int del_file_stat_count = 0;
+    /*由于get_file_area_from_file_stat_list()向global hot_file_zero_file_area链表添加成员，这里遍历hot_file_zero_file_area链表成员，都是在
+     * 异步内存回收线程进行的，不用spin_lock_irq(&p_hot_file_global->hot_file_lock)加锁。除非要把hot_file_zero_file_area链表上的file_stat
+     * 移动到 gloabl hot_file_head_temp、hot_file_head_temp_large、hot_file_head链表。*/
+    //向global  hot_file_zero_file_area添加成员是向链表头添加的，遍历则从链表尾巴开始遍历
+    list_for_each_entry_safe_reverse(p_hot_file_stat,p_hot_file_stat_temp,&p_hot_file_global->hot_file_zero_file_area,hot_file_list){
+	if(!file_stat_in_zero_file_area_list(p_hot_file_stat))
+	    panic("%s file_stat:0x%llx not in_zero_file_area_list status:0x%lx\n",__func__,(u64)p_hot_file_stat,p_hot_file_stat->file_stat_status);
+      
+      if(scan_file_stat_count++ > scan_file_stat_max)
+	  break;
+
+      //如果file_stat对应文件长时间不被访问杂释放掉file_stat结构，这个过程不用spin_lock_irq(&p_hot_file_global->hot_file_lock)加锁
+      if(p_hot_file_stat->file_area_count == 0 && p_hot_file_global->global_age - p_hot_file_stat->max_file_area_age > FILE_STAT_DELETE_AGE_DX){
+	  hot_file_stat_delete(p_hot_file_global,p_hot_file_stat);
+	  del_file_stat_count ++;
+	  //0个file_area的file_stat个数减1
+	  p_hot_file_global->file_stat_count_zero_file_area --;
+      }
+      //如果p_hot_file_stat->file_area_count大于0，说明最近被访问了，则把file_stat移动回 gloabl hot_file_head_temp、hot_file_head_temp_large、hot_file_head链表
+      else if (p_hot_file_stat->file_area_count > 0)
+      {
+	  //0个file_area的file_stat个数减1
+	  p_hot_file_global->file_stat_count_zero_file_area --;
+
+	  spin_lock(&p_hot_file_global->hot_file_lock);
+	  //先清理掉file_stat的in_zero_file_area_list标记
+	  clear_file_stat_in_zero_file_area_list(p_hot_file_stat);
+
+	  //file_stat是热文件则移动到global hot_file_head链表                   
+          if(is_file_stat_hot_file(&hot_file_global_info,p_hot_file_stat)){
+		set_file_stat_in_hot_file_head_list(p_hot_file_stat);                          
+		list_move(&p_hot_file_stat->hot_file_list,&hot_file_global_info.hot_file_head);
+		hot_file_global_info.hot_file_stat_count ++;//热文件数加1
+	  }
+	  //file_stat是大文件则移动到global hot_file_head_temp_large链表
+	  else if(file_stat_in_large_file(p_hot_file_stat)){
+		set_file_stat_in_hot_file_head_temp_list(p_hot_file_stat); 
+		set_file_stat_in_large_file(p_hot_file_stat);
+		list_move(&p_hot_file_stat->hot_file_list,&hot_file_global_info.hot_file_head_temp_large);
+	  } 
+	  //否则，file_stat移动到 global hot_file_head_temp 普通文件链表
+	  else{
+		set_file_stat_in_hot_file_head_temp_list(p_hot_file_stat); 
+		list_move(&p_hot_file_stat->hot_file_list,&hot_file_global_info.hot_file_head_temp);
+	  }
+	  spin_unlock(&p_hot_file_global->hot_file_lock);
+       }
+    }
+
+    p_hot_file_global->hot_file_shrink_counter.del_file_stat_count = del_file_stat_count;
+    p_hot_file_global->hot_file_shrink_counter.scan_zero_file_area_file_stat_count = scan_file_stat_count;
 }
 int walk_throuth_all_hot_file_area(struct hot_file_global *p_hot_file_global)
 {
@@ -3919,6 +4051,7 @@ int walk_throuth_all_hot_file_area(struct hot_file_global *p_hot_file_global)
 	if(!is_file_stat_hot_file(p_hot_file_global,p_hot_file_stat)){
 
             spin_lock_irq(&p_hot_file_global->hot_file_lock);
+	    hot_file_global_info.hot_file_stat_count --;//热文件数减1
 	    clear_file_stat_in_hot_file_head_list(p_hot_file_stat);
 	    set_file_stat_in_hot_file_head_temp_list(p_hot_file_stat);//设置hot_file_stat状态为in_head_temp_list
 	    if(file_stat_in_large_file(p_hot_file_stat))
@@ -3945,12 +4078,15 @@ int walk_throuth_all_hot_file_area(struct hot_file_global *p_hot_file_global)
     //释放的file_stat个数
     p_hot_file_global->hot_file_shrink_counter.del_file_stat_count = del_file_stat_count;
 
+    //对没有file_area的file_stat的处理
+    file_stat_has_zero_file_area_manage(p_hot_file_global);
+
     //打印所有file_stat的file_area个数和page个数
     hot_file_print_all_file_stat(p_hot_file_global);
     //打印内存回收时统计的各个参数
     printk_shrink_param(p_hot_file_global);
 
-    printk(">>>>>0x%llx global_age:%ld file_stat_count:%ld free_pages:%ld<<<<<<\n",(u64)p_hot_file_global,p_hot_file_global->global_age,p_hot_file_global->file_stat_count,nr_reclaimed);
+    printk(">>>>>0x%llx global_age:%ld file_stat_count:%d hot_file_stat_count:%d file_stat_count_zero_file_area:%d free_pages:%ld<<<<<<\n",(u64)p_hot_file_global,p_hot_file_global->global_age,p_hot_file_global->file_stat_count,p_hot_file_global->hot_file_stat_count,p_hot_file_global->file_stat_count_zero_file_area,nr_reclaimed);
 
     return 0;
 }
@@ -4041,6 +4177,15 @@ int hot_file_delete_all_file_stat(struct hot_file_global *p_hot_file_global)
         del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
 	del_file_stat_count ++;
     }
+    
+    //hot_file_global->hot_file_zero_file_area链表
+    list_for_each_entry_safe_reverse(p_hot_file_stat,p_hot_file_stat_temp,&p_hot_file_global->hot_file_zero_file_area,hot_file_list){
+	//标记 p_hot_file_stat->mapping->rh_reserved1=0，表示该文件的file_stat已经释放了
+	hot_file_disable_file_stat_mapping(p_hot_file_global,p_hot_file_stat);
+        del_file_area_count += hot_file_stat_delete_all_file_area(p_hot_file_global,p_hot_file_stat);
+	del_file_stat_count ++;
+    }
+
     printk("hot_file_global->cold_file_head del_file_area_count:%d del_file_stat_count:%d\n",del_file_area_count,del_file_stat_count);
 
     return 0;
@@ -4078,6 +4223,7 @@ int hot_file_init(void)
 
     INIT_LIST_HEAD(&hot_file_global_info.cold_file_head);
     INIT_LIST_HEAD(&hot_file_global_info.hot_file_head_delete);
+    INIT_LIST_HEAD(&hot_file_global_info.hot_file_zero_file_area);
     spin_lock_init(&hot_file_global_info.hot_file_lock);
 
     atomic_set(&hot_file_global_info.ref_count,0);
@@ -4148,6 +4294,7 @@ static void mark_page_accessed_handler_post(struct kprobe *p, struct pt_regs *re
         hot_file_update_file_status(page);
     }
 }
+//在执行__destroy_inode_handler_post()能否休眠，万一上层调用者使用spin_lock锁咋办？得看看__destroy_inode()的上层调用者的代码
 static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 	                unsigned long flags)
 {
@@ -4166,22 +4313,53 @@ static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 	    //smp_rmb();
 	    //到这里时，可能hot_file_disable_file_stat_mapping()函数中已经把inode->i_mapping->rh_reserved1清0，因此需要smp_rmb()后再获取最新的inode->i_mapping->rh_reserved1值，判断是不是0
 	    if(test_bit(0,&hot_file_shrink_enable) && inode->i_mapping->rh_reserved1){
-	        p_hot_file_stat = (struct hot_file_stat *)(inode->i_mapping->rh_reserved1);
-                if(inode->i_mapping != p_hot_file_stat->mapping)
+    
+	       /*差点就犯的超隐藏错误!!!!!!!!!!!!!!!!!!hot_file_stat_delete()把hot_file_stat从hot_file_global的链表剔除，然后file_stat释放后，
+	       //p_hot_file_stat_del->hot_file_list的next和prev就设置成LIST_POISON1/LIST_POISON2.之后能通过下边的if判断判定hot_file_stat是否已经从
+	       //hot_file_global的链表剔除了吗？第一印象可以，但实际p_hot_file_stat_del->hot_file_list.next就会非法内存访问而crash，因为此时这file_stat结构体
+	       //已经释放了，p_hot_file_stat_del->hot_file_list指向的这个结构体内存已经释放了，是无效内存!!!!!解决方法是，hot_file_stat_delete()释放file_stat前
+	       //先把inode->i_mapping->rh_reserved1清0，然后这里看到inode->i_mapping->rh_reserved1是0就不再使用file_stat了*/
+	     #if 0	
+		//如果异步内存回收线程执行hot_file_stat_delete()已经把file_stat释放了，此时也会把file_stat从hot_file_global的链表中剔除，该if成立，直接return
+                if((p_hot_file_stat_del->hot_file_list.next == LIST_POISON1) || (p_hot_file_stat_del->hot_file_list.prev == LIST_POISON2)){
+		    unlock_file_stat(p_hot_file_stat);
 		    return;
+		}
+            #else
+		smp_rmb();
+		//如果file_stat在hot_file_stat_delete()中被释放了，会把inode->i_mapping->rh_reserved1清0，这里不再使用file_stat
+		if(0 == inode->i_mapping->rh_reserved1){
+		    //p_hot_file_stat->mapping = NULL;
+		    //unlock_file_stat(p_hot_file_stat);
+		    return;
+		}
+            #endif		
+	        p_hot_file_stat = (struct hot_file_stat *)(inode->i_mapping->rh_reserved1);
+		//如果
+                if(inode->i_mapping != p_hot_file_stat->mapping){
+		    unlock_file_stat(p_hot_file_stat);
+		    return;
+		}
 
-                //把p_hot_file_stat->mapping = NULL放到file_stat加锁前边，当该函数因hot_file_isolate_lru_pages()隔离page时先对file_stat加锁，导致这里加锁失败而休眠。
-		//但是先p_hot_file_stat->mapping = NULL了，这样hot_file_isolate_lru_pages()见到p_hot_file_stat->mapping是NULL，立即释放file_stat锁
-		p_hot_file_stat->mapping = NULL;
-		//对file_stat加锁，防止并发
+                /*把p_hot_file_stat->mapping = NULL放到file_stat加锁前边，当该函数因hot_file_isolate_lru_pages()隔离page时先对file_stat加锁，导致这里加锁失败而休眠。
+		但是先p_hot_file_stat->mapping = NULL了，这样hot_file_isolate_lru_pages()见到p_hot_file_stat->mapping是NULL，立即释放file_stat锁。但是想想又不对，
+		p_hot_file_stat->mapping=NULL和inode->i_mapping->rh_reserved1=0都放到加锁里,一起清0.p_hot_file_stat->mapping是NULL才能代表
+		inode->i_mapping->rh_reserved1是0。不仅有这个问题，如果p_hot_file_stat->mapping = NULL赋值放到lock_file_stat加锁外边，可能hot_file_stat_delete()
+		中，if(p_hot_file_stat->mapping) p_hot_file_stat->mapping->rh_reserved1 = 0,if因当前cpu还未获取p_hot_file_stat->mapping最新值NULL而if成立，然后
+		p_hot_file_stat->mapping->rh_reserved1 = 0赋值时，p_hot_file_stat->mapping是NULL生效了，此时就要crash*/
+		//p_hot_file_stat->mapping = NULL;
+		
+		//对file_stat加锁，此时异步内存回收线程会执行hot_file_stat_delete()释放file_stat结构，然后这里再使用file_stat就会crash了。必须等hot_file_stat_delete()
+		//里释放完file_stat，然后把inode->i_mapping->rh_reserved1清0，释放file_stat锁后。这里才能继续运行，然后因为inode->i_mapping->rh_reserved1是0直接return
 		lock_file_stat(p_hot_file_stat);
-
+               
 		//xfs文件系统不会对新分配的inode清0，因此要主动对inode->i_mapping->rh_reserved1清0，防止该file_stat和inode被释放后。立即被其他进程分配了这个inode，但是没有对
 		//inode清0，导致inode->i_mapping->rh_reserved1还保存着老的已经释放的file_stat，因为inode->i_mapping->rh_reserved1不是0，不对这个file_stat初始化，
 		//然后把file_area添加到这个无效file_stat，就要crash。但是要把inode->i_mapping->rh_reserved1 = 0放到set_file_stat_in_delete(p_hot_file_stat)
 		//前边。否则的话，set_file_stat_in_delete(p_hot_file_stat)标记file_stat的delete标记位后，file_stat不能再被用到，但是inode->i_mapping->rh_reserved1还不是0，
 		//这样可能inode->i_mapping->rh_reserved1指向的file_stat还会被添加file_area，会出问题的，导致crash都有可能!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 		inode->i_mapping->rh_reserved1 = 0;
+		p_hot_file_stat->mapping = NULL;
 		//这里有个很大的隐患，此时file_stat可能处于global hot_file_head、hot_file_head_temp、hot_file_head_temp_large 3个链表，这里突然设置set_file_stat_in_delete，
 		//将来这些global 链表遍历这个file_stat，发现没有 file_stat_in_hot_file_head等标记，会主动触发panic()。不对，set_file_stat_in_delete并不会清理原有的
 		//file_stat_in_hot_file_head等标记，杞人忧天了。
@@ -4189,16 +4367,33 @@ static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 		smp_wmb(); 
 
 		unlock_file_stat(p_hot_file_stat);
-		printk("hot_file_stat:0x%llx delete !!!!!!!!!!!!!!!!\n",(u64)p_hot_file_stat);
+		printk("%s hot_file_stat:0x%llx delete !!!!!!!!!!!!!!!!\n",__func__,(u64)p_hot_file_stat);
+	    }
+	    else
+	    {//到这个分支说明hot_file_shrink_enable已经被驱动卸载并发清0了，那就goto file_stat_delete分支，择机把inode->i_mapping->rh_reserved1清0，保证这个inode被新的进程读写文件
+	     //分配后，因文件访问执行hot_file_update_file_status()时，inode->i_mapping->rh_reserved1是0，则重新分配一个新的file_stat，否则会使用inode->i_mapping->rh_reserved1指向的老的已经释放的file_stat
+	        atomic_dec(&hot_file_global_info.inode_del_count);
+	        goto file_stat_delete;
 	    }
 	    atomic_dec(&hot_file_global_info.inode_del_count);
         }
 	else
 	//走这个分支，说明现在驱动在卸载。驱动卸载后时可能释放了file_stat结构，此时__destroy_inode_handler_post()就不能再使用了file_stat了，
-	//"set_file_stat_in_delete(p_hot_file_stat)"执行时就会导致crash。于是两个流程都spin_lock加锁防护并发操作
+	//比如"set_file_stat_in_delete(p_hot_file_stat)"执行时就会导致crash。于是两个流程都spin_lock加锁防护并发操作
 	{
-	    //在这个分支不用再 lock_file_stat加锁了，因为到这里，驱动开始卸载，异步内存回收线程不再运行，也hot_file_print_all_file_stat()禁止执行打印file_stat信息。
+file_stat_delete:
+
+	    //这里不用再对file_stat加锁，因为hot_file_stat_delete()里把inode->i_mapping->rh_reserved1清0放到了spin lock加锁了，已经可以防止并发释放/使用 file_stat
+	    //lock_file_stat(p_hot_file_stat);
+
+	    //在这个分支不用再 lock_file_stat加锁了，因为到这里，驱动开始卸载，异步内存回收线程不再运行，同时hot_file_print_all_file_stat()禁止执行使用file_stat打印信息
+	    //这个spin lock加锁是防止此时驱动卸载并发执行hot_file_stat_delete()释放file_stat结构，此时这里再使用file_stat就会crash
 	    spin_lock(&hot_file_global_info.hot_file_lock);
+	    //inode->i_mapping->rh_reserved1是0说明驱动卸载流程执行hot_file_stat_delete()释放了file_stat，把inode->i_mapping->rh_reserved1清0，这里不能再使用file_stat
+	    if(0 == inode->i_mapping->rh_reserved1){
+	        spin_unlock(&hot_file_global_info.hot_file_lock);
+		return;
+	    }
 	    p_hot_file_stat = (struct hot_file_stat *)(inode->i_mapping->rh_reserved1);
 	    if(inode->i_mapping->rh_reserved1 && inode->i_mapping == p_hot_file_stat->mapping){
 
