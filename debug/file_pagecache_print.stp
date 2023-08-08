@@ -1,0 +1,32 @@
+global file_pagecache_count;
+probe kernel.trace("mm_filemap_add_to_page_cache")
+{
+    if($page->mapping && $page->mapping->host & $page->mapping->host->i_dentry->first){
+        dentry = $page->mapping->host->i_dentry->first - 0xb0;
+        //file_pagecache_count[dentry] = $page->mapping->nrpages;
+        file_pagecache_count[dentry,reverse_path_walk(dentry)] += 1;
+    }
+}
+probe kernel.trace("mm_filemap_delete_from_page_cache")
+{
+    if($page->mapping && $page->mapping->host & $page->mapping->host->i_dentry->first){
+        dentry = $page->mapping->host->i_dentry->first - 0xb0
+	name = reverse_path_walk(dentry)
+	if(file_pagecache_count[dentry,name] > 0)
+            file_pagecache_count[dentry,name] -= 1;
+    }
+}
+probe timer.s(10)
+{
+    vaild_dentry = 0;
+    foreach( var=[dentry,name] in file_pagecache_count - limit 100){
+        if(file_pagecache_count[dentry,name] > 0){
+	    printf("dentry:0x%x %s pagecache:%dk\n",dentry,name,file_pagecache_count[dentry,name]*4)
+	    vaild_dentry ++;
+	}
+    }
+
+    if(vaild_dentry > 0){
+        printf("\n");
+    }
+}
