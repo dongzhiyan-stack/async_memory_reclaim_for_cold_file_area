@@ -110,8 +110,8 @@ struct hot_cold_file_shrink_counter
 //当一个文件file_stat长时间不被访问，释放掉了所有的file_area，再过FILE_STAT_DELETE_AGE_DX个周期，则释放掉file_stat结构
 #define FILE_STAT_DELETE_AGE_DX  50
 
-//一个 file_area 包含的page数，默认6个
-#define PAGE_COUNT_IN_AREA_SHIFT 3
+//一个 file_area 包含的page数，默认4个
+#define PAGE_COUNT_IN_AREA_SHIFT 2
 #define PAGE_COUNT_IN_AREA (1UL << PAGE_COUNT_IN_AREA_SHIFT)
 
 #define TREE_MAP_SHIFT	6
@@ -128,7 +128,7 @@ struct hot_cold_file_shrink_counter
 //一个冷file_area，如果经过HOT_FILE_AREA_FREE_LEVEL个周期，仍然没有被访问，则释放掉file_area结构
 #define HOT_FILE_AREA_FREE_LEVEL  6
 //当一个file_area在一个周期内访问超过FILE_AREA_HOT_LEVEL次数，则判定是热的file_area
-#define FILE_AREA_HOT_LEVEL 3
+#define FILE_AREA_HOT_LEVEL (PAGE_COUNT_IN_AREA + 1)
 //一个file_area表示了一片page范围(默认6个page)的冷热情况，比如page索引是0~5、6~11、12~17各用一个file_area来表示
 struct file_area
 {
@@ -142,7 +142,7 @@ struct file_area
     //该file_area最新依次被访问时的global_age，global_age - file_area_age差值大于 GOLD_FILE_AREA_LEVAL，则判定file_area是冷file_area，然后释放该file_area的page
     unsigned long file_area_age;
     //该file_area当前周期被访问的次数
-    unsigned int area_access_count;
+    unsigned int access_count;
     //该file_area里的某个page最近一次被回收的时间点，单位秒
     unsigned int shrink_time;
     //file_area通过file_area_list添加file_stat的各种链表
@@ -982,7 +982,7 @@ static unsigned int async_shrink_free_page(struct pglist_data *pgdat,struct lruv
 {
 	LIST_HEAD(ret_pages);
 	LIST_HEAD(free_pages);
-    #if 1
+    #if 0
 	LIST_HEAD(demote_pages);
 	bool do_demote_pass;
     #endif
@@ -1038,8 +1038,8 @@ retry:
 		        page_unevictable_count ++;
 			goto activate_locked;
 		}
-
-		if (!sc->may_unmap && page_mapped(page))
+                //强制不回收mmap的page
+		if (/*!sc->may_unmap &&*/ page_mapped(page))
 			goto keep_locked;
 
 		may_enter_fs = (sc->gfp_mask & __GFP_FS) ||
@@ -1325,7 +1325,7 @@ static int  __hot_cold_file_isolate_lru_pages(pg_data_t *pgdat,struct page * pag
         return -1;
      //源头已经确保page不是mmap的，这里不用重复判断。但是想想还是加上吧，因为怕page中途被设置成mmap了。
 #if 1
-    if (!sc->may_unmap && page_mapped(page))
+    if (/*!sc->may_unmap &&*/ page_mapped(page))
         return -1;
 #endif
    /*
@@ -1469,7 +1469,7 @@ static unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_
 	 */
 	spin_lock(&p_file_stat->file_stat_lock);
 	//如果此时file_area又被访问了，则不再释放，并移动回file_area_temp链表
-	//if(p_file_area->area_access_count - p_file_area->last_access_count  0){
+	//if(p_file_area->access_count - p_file_area->last_access_count  0){
 	if(p_hot_cold_file_global->global_age == p_file_area->file_area_age){
             list_move(&p_file_area->file_area_list,&p_file_stat->file_area_temp);
 	    set_file_area_in_temp_list(p_file_area);
@@ -2164,29 +2164,29 @@ already_alloc:
 		//如果第一次把索引是0的file_area插入file_area tree，是把该file_area指针保存到file_area tree的根节点，此时parent_node是NULL
 		if(parent_node)
 		    parent_node->count ++;//父节点下的file_area个数加1
-		//令新创建的file_area的last_access_count为1，跟area_access_count相等。如果将来walk_throuth_all_file_area()扫描到file_area
-		//的last_access_count和area_access_count都是1，说明后续该file_area就没被访问过。
+		//令新创建的file_area的last_access_count为1，跟access_count相等。如果将来walk_throuth_all_file_area()扫描到file_area
+		//的last_access_count和access_count都是1，说明后续该file_area就没被访问过。
 		//p_file_area->last_access_count = 1;
 		
 		p_file_stat->file_area_count ++;//文件file_stat的file_area个数加1
 		set_file_area_in_temp_list(p_file_area);//新分配的file_area必须设置in_temp_list链表
             }
 	    p_file_area = *page_slot_in_tree;
-	    //hot_cold_file_global_info.global_age更新了，把最新的global age更新到本次访问的file_area->file_area_age。并对file_area->area_access_count清0，本周期被访问1次则加1
+	    //hot_cold_file_global_info.global_age更新了，把最新的global age更新到本次访问的file_area->file_area_age。并对file_area->access_count清0，本周期被访问1次则加1
 	    if(p_file_area->file_area_age < hot_cold_file_global_info.global_age){
 		p_file_area->file_area_age = hot_cold_file_global_info.global_age;
 		if(p_file_area->file_area_age > p_file_stat->max_file_area_age)
                     p_file_stat->max_file_area_age = p_file_area->file_area_age;
 
-	        p_file_area->area_access_count = 0;
+	        p_file_area->access_count = 0;
 	    }
 	    //file_area区域的page被访问的次数加1
-	    p_file_area->area_access_count ++;
+	    p_file_area->access_count ++;
 
 	    //如果p_file_area在当前周期第1次被访问，则把移动到file_area_hot链表头，该链表头的file_area访问比较频繁，链表尾的file_area很少访问。
 	    //将来walk_throuth_all_file_area()函数扫描释放page时过程，遍历到file_area所处的file_stat并释放内存page时，遍历这些file_stat的file_area_hot
 	    //链表尾巴的file_area，如果这些file_area在移动到file_area_hot链表后,很少访问了，则把把这些file_area再降级移动回file_area_temp链表头
-            if(p_file_area->area_access_count == 1)
+            if(p_file_area->access_count == 1)
 	    {
 		//如果p_file_area不在file_area_hot或file_area_temp链表头，才把它添加到file_area_hot或file_area_temp链表头
 		//file_stat的file_area_hot或file_area_temp链表头的file_area是最频繁访问的，链表尾的file_area访问频次低，内存回收光顾这些链表尾的file_area
@@ -2204,8 +2204,8 @@ already_alloc:
 
             //如果p_file_area是冷热不定的，并且file_area的本轮访问次数大于阀值，则设置file_area热，并且把该file_area移动到file_area_hot链表
 	    if(file_area_in_temp_list(p_file_area) &&  
-		    //p_file_area->area_access_count - p_file_area->last_access_count >= FILE_AREA_HOT_LEVEL){
-		p_file_area->area_access_count > FILE_AREA_HOT_LEVEL){
+		    //p_file_area->access_count - p_file_area->last_access_count >= FILE_AREA_HOT_LEVEL){
+		p_file_area->access_count > FILE_AREA_HOT_LEVEL){
 
 		clear_file_area_in_temp_list(p_file_area);
                 //设置file_area 处于 file_area_hot链表
@@ -2273,7 +2273,7 @@ already_alloc:
 	    spin_unlock(&p_file_stat->file_stat_lock);
 
 	    //文件file_stat的file_area个数大于阀值则移动到global file_stat_hot_head_large_file_temp链表
-	    if(is_file_stat_large_file(&hot_cold_file_global_info,p_file_stat)){
+	    if(is_file_stat_large_file(&hot_cold_file_global_info,p_file_stat) && file_area_in_temp_list(p_file_area)){
 		smp_rmb();
 		//walk_throuth_all_file_area()函数中也有的大量的访问file_stat或file_area状态的，他们需要smp_rmb()吗，需要留意???????????????????????????????????????
 		if(!file_stat_in_large_file(p_file_stat)){
@@ -2290,8 +2290,8 @@ already_alloc:
 		}
 	    }
 	    //parent_node可能是NULL，此时索引是0的file_area保存在hot_cold_file_tree的根节点root_node里
-	    if(0 && open_shrink_printk && p_file_area->area_access_count == 1 && parent_node)
-	        printk("%s %s %d hot_cold_file_global_info:0x%llx p_file_stat:0x%llx status:0x%lx p_file_area:0x%llx status:0x%x file_area->area_access_count:%d file_area->file_area_age:%lu page:0x%llx page->index:%ld file_area_hot_count:%d file_area_count:%d shrink_time:%d start_index:%ld page_slot_in_tree:0x%llx tree-height:%d parent_node:0x%llx parent_node->count:0x%d\n",__func__,current->comm,current->pid,(u64)(&hot_cold_file_global_info),(u64)p_file_stat,p_file_stat->file_stat_status,(u64)p_file_area,p_file_area->file_area_state,p_file_area->area_access_count,p_file_area->file_area_age,(u64)page,page->index,p_file_stat->file_area_hot_count,p_file_stat->file_area_count,p_file_area->shrink_time,p_file_area->start_index,(u64)page_slot_in_tree,p_file_stat->hot_cold_file_area_tree_root_node.height,(u64)parent_node,parent_node->count);
+	    if(0 && open_shrink_printk && p_file_area->access_count == 1 && parent_node)
+	        printk("%s %s %d hot_cold_file_global_info:0x%llx p_file_stat:0x%llx status:0x%lx p_file_area:0x%llx status:0x%x file_area->access_count:%d file_area->file_area_age:%lu page:0x%llx page->index:%ld file_area_hot_count:%d file_area_count:%d shrink_time:%d start_index:%ld page_slot_in_tree:0x%llx tree-height:%d parent_node:0x%llx parent_node->count:0x%d\n",__func__,current->comm,current->pid,(u64)(&hot_cold_file_global_info),(u64)p_file_stat,p_file_stat->file_stat_status,(u64)p_file_area,p_file_area->file_area_state,p_file_area->access_count,p_file_area->file_area_age,(u64)page,page->index,p_file_stat->file_area_hot_count,p_file_stat->file_area_count,p_file_area->shrink_time,p_file_area->start_index,(u64)page_slot_in_tree,p_file_stat->hot_cold_file_area_tree_root_node.height,(u64)parent_node,parent_node->count);
 	   
 	    if(p_file_area->file_area_age > hot_cold_file_global_info.global_age)
 	        panic("p_file_area->file_area_age:%ld > hot_cold_file_global_info.global_age:%ld\n",p_file_area->file_area_age,hot_cold_file_global_info.global_age);
@@ -2598,7 +2598,7 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_cold_file_globa
 
 	    scan_file_area_count ++;
 	    //本周期内，该p_file_area 依然没有被访问，移动到file_area_cold链表头
-	    //if(p_file_area->area_access_count == p_file_area->last_access_count){
+	    //if(p_file_area->access_count == p_file_area->last_access_count){
 	    
             //file_area经过GOLD_FILE_AREA_LEVAL个周期还没有被访问，则被判定是冷file_area，然后就释放该file_area的page
 	    if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > GOLD_FILE_AREA_LEVAL){
@@ -3263,13 +3263,17 @@ static int hot_cold_file_thread(void *p){
     int sleep_count = 0;
 
     while(1){
+	if (kthread_should_stop())
+	    return 0;
+
 	sleep_count = 0;
-        while(sleep_count ++ < 10)
+        while(sleep_count ++ < 60){
             msleep(1000);
+	    if (kthread_should_stop())
+	        return 0;
+	}
 
 	walk_throuth_all_file_area(p_hot_cold_file_global);
-	if (kthread_should_stop())
-	    break;
     }
     return 0;
 }
@@ -3528,6 +3532,9 @@ static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
     cold_file_delete_all_file_stat(&hot_cold_file_global_info);
     unregister_kprobe(&kp_mark_page_accessed);
     unregister_kprobe(&kp__destroy_inode);
+    kmem_cache_destroy(hot_cold_file_global_info.file_stat_cachep);
+    kmem_cache_destroy(hot_cold_file_global_info.file_area_cachep);
+    kmem_cache_destroy(hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep);
 }
 module_init(async_memory_reclaime_for_cold_file_area_init);
 module_exit(async_memory_reclaime_for_cold_file_area_exit);
