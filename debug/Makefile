@@ -1,4 +1,4 @@
-obj-m := async_memory_reclaim_for_cold_file_area.o
+obj-m := async_memory_reclaim_for_cold_file_area_debug.o
 
 CROSS_COMPILE=''                                                                                                                                                                          
 
