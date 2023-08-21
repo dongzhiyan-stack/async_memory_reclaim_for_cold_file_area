@@ -3112,13 +3112,27 @@ int hot_cold_file_init(void)
 	return 0;
 }
 /*****************************************************************************************/
+/*因为buffer io write的page不会调用到mark_page_accessed()，因此考虑kprobe pagecache_get_page。但是分析generic_file_buffered_read()源码，有概率goto no_cached_page分支，
+ * 导致本次读的文件页不会调用到find_get_page()->pagecache_get_page()。考虑再三把kprobe的函数换成buffer io read/write 会执行到拷贝用户空间数据的两个函数*/
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
-static struct kprobe kp_mark_page_accessed = {
+/*static struct kprobe kp_mark_page_accessed = {
 	.symbol_name    = "mark_page_accessed",
+};*/
+static struct kprobe kp_read_cache_func = {
+	.symbol_name    = "iov_iter_copy_from_user_atomic",//buffer io write把数据写入文件页page执行到
+};
+static struct kprobe kp_write_cache_func = {
+	.symbol_name    = "copy_page_to_iter",//buffer io read读取文件页page数据执行到
 };
 #else
-static struct kprobe kp_mark_page_accessed = {
+/*static struct kprobe kp_mark_page_accessed = {
 	.symbol_name    = "folio_mark_accessed",
+};*/
+static struct kprobe kp_read_cache_func = {
+	.symbol_name    = "copy_page_from_iter_atomic",//buffer io write把数据写入文件页page执行到
+};
+static struct kprobe kp_write_cache_func = {
+	.symbol_name    = "copy_page_to_iter",//buffer io read读取文件页page数据执行到 copy_folio_to_iter()
 };
 #endif
 static struct kprobe kp__destroy_inode = {
@@ -3220,17 +3234,28 @@ file_stat_delete:
 static int __init async_memory_reclaime_for_cold_file_area_init(void)
 {
 	int ret;
-	kp_mark_page_accessed.post_handler = mark_page_accessed_handler_post;
-	//kp_mark_page_accessed.fault_handler = handler_fault;
+	//kp_mark_page_accessed.post_handler = mark_page_accessed_handler_post;
+	kp_read_cache_func.post_handler = mark_page_accessed_handler_post;
+	kp_write_cache_func.post_handler = mark_page_accessed_handler_post;
 	kp__destroy_inode.post_handler = __destroy_inode_handler_post;
-	//kp_mark_page_accessed.fault_handler = handler_fault;
 
 
-	ret = register_kprobe(&kp_mark_page_accessed);
+	/*ret = register_kprobe(&kp_mark_page_accessed);
 	if (ret < 0) {
 		pr_err("kp_mark_page_accessed register_kprobe failed, returned %d\n", ret);
 		goto err;
+	}*/
+	ret = register_kprobe(&kp_read_cache_func);
+	if (ret < 0) {
+		pr_err("kp_read_cache_func register_kprobe failed, returned %d\n", ret);
+		goto err;
 	}
+	ret = register_kprobe(&kp_write_cache_func);
+	if (ret < 0) {
+		pr_err("kp_write_cache_func register_kprobe failed, returned %d\n", ret);
+		goto err;
+	}
+
 	ret = register_kprobe(&kp__destroy_inode); 
 	if (ret < 0) {
 		pr_err("kp__destroy_inode register_kprobe failed, returned %d\n", ret);
@@ -3242,8 +3267,13 @@ static int __init async_memory_reclaime_for_cold_file_area_init(void)
 	}
 	return 0;
 err:
-	if(kp_mark_page_accessed.post_handler)
-		unregister_kprobe(&kp_mark_page_accessed);
+	/*if(kp_mark_page_accessed.post_handler)
+		unregister_kprobe(&kp_mark_page_accessed);*/
+	if(kp_read_cache_func.post_handler)
+		unregister_kprobe(&kp_read_cache_func);
+	if(kp_write_cache_func.post_handler)
+		unregister_kprobe(&kp_write_cache_func);
+
 
 	if(kp__destroy_inode.post_handler)
 		unregister_kprobe(&kp__destroy_inode);
@@ -3270,7 +3300,9 @@ static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
 	}
 
 	cold_file_delete_all_file_stat(&hot_cold_file_global_info);
-	unregister_kprobe(&kp_mark_page_accessed);
+	//unregister_kprobe(&kp_mark_page_accessed);
+	unregister_kprobe(&kp_read_cache_func);
+	unregister_kprobe(&kp_write_cache_func);
 	unregister_kprobe(&kp__destroy_inode);
 	kmem_cache_destroy(hot_cold_file_global_info.file_stat_cachep);
 	kmem_cache_destroy(hot_cold_file_global_info.file_area_cachep);
