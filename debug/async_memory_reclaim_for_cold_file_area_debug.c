@@ -48,16 +48,16 @@
 #include <linux/kallsyms.h>
 #include <linux/version.h>
 #include <linux/mm_inline.h>
-//内存回收周期，单位s
-#define MEMORY_RECLIAIM_PERIOD 60
+#include <linux/proc_fs.h>
+
+//异步内存回收周期，单位s
+#define ASYNC_MEMORY_RECLIAIM_PERIOD 60
 //置1会把内存回收信息详细打印出来
 int shrink_page_printk_open1 = 0;
 //不怎么关键的调试信息
 int shrink_page_printk_open = 0;
 
 unsigned long file_area_shrink_page_enable = 1;
-void inline update_async_shrink_page(struct page *page);
-int hot_cold_file_init(void);
 /***************************************************************/
 struct hot_cold_file_shrink_counter
 {
@@ -107,12 +107,16 @@ struct hot_cold_file_shrink_counter
 
 	/**file_stat_has_zero_file_area_manage()函数****/
 	unsigned int scan_zero_file_area_file_stat_count;
+
+	/*********************************************/
+	//进程抢占lru_lock锁的次数
+    unsigned int lru_lock_contended_count;
 };
 
 //最大文件名字长度
 #define MAX_FILE_NAME_LEN 100
 //当一个文件file_stat长时间不被访问，释放掉了所有的file_area，再过FILE_STAT_DELETE_AGE_DX个周期，则释放掉file_stat结构
-#define FILE_STAT_DELETE_AGE_DX  50
+#define FILE_STAT_DELETE_AGE_DX  10
 
 //一个 file_area 包含的page数，默认4个
 #define PAGE_COUNT_IN_AREA_SHIFT 2
@@ -125,12 +129,16 @@ struct hot_cold_file_shrink_counter
 #define TREE_ENTRY_MASK 3
 #define TREE_INTERNAL_NODE 1
 
-//file_area在 GOLD_FILE_AREA_LEVAL 个周期内没有被访问则被判定是冷file_area，然后释放这个file_area的page
-#define GOLD_FILE_AREA_LEVAL  5
+//热file_area经过FILE_AREA_HOT_to_TEMP_AGE_DX个周期后，还没有被访问，则移动到file_area_temp链表
+#define FILE_AREA_HOT_to_TEMP_AGE_DX  3
+//发生refault的file_area经过FILE_AREA_REFAULT_TO_TEMP_AGE_DX个周期后，还没有被访问，则移动到file_area_temp链表
+#define FILE_AREA_REFAULT_TO_TEMP_AGE_DX 10
+//普通的file_area在FILE_AREA_TEMP_TO_COLD_AGE_DX个周期内没有被访问则被判定是冷file_area，然后释放这个file_area的page
+#define FILE_AREA_TEMP_TO_COLD_AGE_DX  5
+//一个冷file_area，如果经过FILE_AREA_FREE_AGE_DX个周期，仍然没有被访问，则释放掉file_area结构
+#define FILE_AREA_FREE_AGE_DX  5
 
 #define FILE_AREA_HOT_BIT (1 << 0)//file_area的bit0是1表示是热的file_area_hot,是0则是冷的。bit1是1表示是热的大文件，是0则是小文件
-//一个冷file_area，如果经过HOT_FILE_AREA_FREE_LEVEL个周期，仍然没有被访问，则释放掉file_area结构
-#define HOT_FILE_AREA_FREE_LEVEL  6
 //当一个file_area在一个周期内访问超过FILE_AREA_HOT_LEVEL次数，则判定是热的file_area
 #define FILE_AREA_HOT_LEVEL (PAGE_COUNT_IN_AREA + 1)
 //一个file_area表示了一片page范围(默认6个page)的冷热情况，比如page索引是0~5、6~11、12~17各用一个file_area来表示
@@ -143,7 +151,7 @@ struct file_area
 	unsigned char file_area_state;
 	//该file_area 上轮被访问的次数
 	//unsigned int last_access_count;
-	//该file_area最新依次被访问时的global_age，global_age - file_area_age差值大于 GOLD_FILE_AREA_LEVAL，则判定file_area是冷file_area，然后释放该file_area的page
+	//该file_area最新依次被访问时的global_age，global_age - file_area_age差值大于 FILE_AREA_TEMP_TO_COLD_AGE_DX，则判定file_area是冷file_area，然后释放该file_area的page
 	unsigned long file_area_age;
 	//该file_area当前周期被访问的次数
 	unsigned int access_count;
@@ -246,6 +254,19 @@ struct hot_cold_file_global
 	atomic_t   ref_count;
 	atomic_t   inode_del_count;
 	struct hot_cold_file_shrink_counter hot_cold_file_shrink_counter;
+	struct proc_dir_entry *hot_cold_file_proc_root;
+
+	unsigned int global_age_period;//异步内存回收周期，单位s
+	//热file_area经过file_area_refault_to_temp_age_dx个周期后，还没有被访问，则移动到file_area_temp链表
+	unsigned int file_area_hot_to_temp_age_dx;
+	//发生refault的file_area经过file_area_refault_to_temp_age_dx个周期后，还没有被访问，则移动到file_area_temp链表
+	unsigned int file_area_refault_to_temp_age_dx;
+	//普通的file_area在file_area_temp_to_cold_age_dx个周期内没有被访问则被判定是冷file_area，然后释放这个file_area的page
+	unsigned int file_area_temp_to_cold_age_dx;
+	//一个冷file_area，如果经过file_area_free_age_dx_fops个周期，仍然没有被访问，则释放掉file_area结构
+	unsigned int file_area_free_age_dx;
+	//当一个文件file_stat长时间不被访问，释放掉了所有的file_area，再过file_stat_delete_age_dx个周期，则释放掉file_stat结构
+	unsigned int file_stat_delete_age_dx;
 };
 
 static struct kprobe kp_kallsyms_lookup_name = {
@@ -362,9 +383,13 @@ static inline void unlock_file_stat(struct file_stat * p_file_stat){
 	clear_bit_unlock(F_file_stat_lock, &p_file_stat->file_stat_status);
 }
 
-
 struct hot_cold_file_global hot_cold_file_global_info;
 
+int update_async_shrink_page(struct page *page);
+
+static int hot_cold_file_init(void);
+static int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_file_global,struct seq_file *m,int is_proc_print);
+static void printk_shrink_param(struct hot_cold_file_global *p_hot_cold_file_global,struct seq_file *m,int is_proc_print);
 /*************以下代码不同内核版本可能有差异******************************************************************************************/
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
 struct scan_control_async {
@@ -592,6 +617,10 @@ static unsigned int async_shrink_free_page(struct pglist_data *pgdat,struct lruv
 		unlock_page(page);
 free_it:
 		nr_reclaimed++;
+		//如果要释放的page引用计数不是0，那就有问题了，主动触发crash
+		if(atomic_read(&page->_refcount) != 0){
+			panic("page:0x%llx refcount:%d error!!!!!\n",(u64)page,atomic_read(&page->_refcount));
+		}
 		list_add(&page->lru, &free_pages);
 		continue;
 activate_locked:
@@ -1160,6 +1189,10 @@ retry:
 		}
 		unlock_page(page);
 free_it:
+		//如果要释放的page引用计数不是0，那就有问题了，主动触发crash
+		if(atomic_read(&page->_refcount) != 0){
+			panic("page:0x%llx refcount:%d error!!!!!\n",(u64)page,atomic_read(&page->_refcount));
+		}
 		/*
 		 * THP may get swapped out in a whole, need account
 		 * all base pages.
@@ -1436,6 +1469,7 @@ static unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_
 	pg_data_t *pgdat = NULL;
 	struct page *page;
 	unsigned int isolate_pages = 0;
+	int traverse_file_area_count = 0;  
 	struct list_head *dst;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
 	//struct folio *folio = NULL;
@@ -1452,6 +1486,30 @@ static unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_
 	//!!!!!!!!!!!!!!隐藏非常深的地方，这里遍历file_area_free(即)链表上的file_area时，可能该file_area在hot_file_update_file_status()中被访问而移动到了temp链表
 	//这里要用list_for_each_entry_safe()，不能用list_for_each_entry!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 	list_for_each_entry_safe(p_file_area,tmp_file_area,file_area_free,file_area_list){
+
+        //如果遍历16个file_area,则检测一次是否有其他进程获取lru_lock锁失败而阻塞.有的话就释放lru_lock锁，先休眠5ms再获取锁,防止那些进程阻塞太长时间
+		/*是否有必要释放lru_lock锁时，也lock_file_stat()释放file_stat锁呢？此时可能处要使用lock_file_stat，1:inode删除 2：
+		 *hot_cold_file_print_all_file_stat打印file_stat信息3:file_stat因为0个file_area而要删除.但这里仅休眠5ms不会造成太大阻塞。故不释放file_stat锁*/
+		if(traverse_file_area_count++ >= 16){
+			    traverse_file_area_count = 0;
+			#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)	
+				//使用pgdat->lru_lock锁，且有进程阻塞在这把锁上
+				if(pgdat && spin_is_contended(&pgdat->lru_lock)){
+					spin_unlock(&pgdat->lru_lock); 
+					msleep(5);
+					spin_lock(&pgdat->lru_lock);
+					p_hot_cold_file_global->hot_cold_file_shrink_counter.lru_lock_contended_count ++;
+				}
+            #else
+				//使用 lruvec->lru_lock 锁，且有进程阻塞在这把锁上
+				if(lruvec && spin_is_contended(&lruvec->lru_lock)){
+					spin_unlock(&lruvec->lru_lock); 
+					msleep(5);
+					spin_lock(&lruvec->lru_lock);
+					p_hot_cold_file_global->hot_cold_file_shrink_counter.lru_lock_contended_count ++;
+				}
+            #endif
+		}
 		//如果在遍历file_stat的file_area过程，__destroy_inode_handler_post()里释放该file_stat对应的inode和mapping，则对file_stat加锁前先p_file_stat->mapping =NULL.
 		//然后这里立即goto err并释放file_stat锁，最后__destroy_inode_handler_post()可以立即获取file_stat锁
 		if(NULL == p_file_stat->mapping){
@@ -1605,6 +1663,385 @@ err:
 /*************以上代码不同内核版本可能有差异******************************************************************************************/
 
 /*************以下代码不同内核版本保持一致******************************************************************************************/
+//file_area_hot_to_temp_age_dx
+static int file_area_hot_to_temp_age_dx_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", hot_cold_file_global_info.file_area_hot_to_temp_age_dx);
+	return 0;
+}
+static int file_area_hot_to_temp_age_dx_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, file_area_hot_to_temp_age_dx_show, NULL);
+}
+static ssize_t file_area_hot_to_temp_age_dx_write(struct file *file,
+				const char __user *buffer, size_t count, loff_t *ppos)
+{
+    int rc;
+	unsigned int val;
+	rc = kstrtouint_from_user(buffer, count, 10,&val);
+	if (rc)
+	    return rc;
+
+    if(val < 100)
+	    hot_cold_file_global_info.file_area_hot_to_temp_age_dx = val;
+	else
+		return -EINVAL;
+
+	return count;
+}
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
+static const struct file_operations file_area_hot_to_temp_age_dx_fops = {
+    .open		= file_area_hot_to_temp_age_dx_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= file_area_hot_to_temp_age_dx_write,
+};
+#else
+static const struct proc_ops file_area_hot_to_temp_age_dx_fops = {
+    .proc_open		= file_area_hot_to_temp_age_dx_open,
+	.proc_read		= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write		= file_area_hot_to_temp_age_dx_write,
+};
+#endif
+//file_area_refault_to_temp_age_dx
+static int file_area_refault_to_temp_age_dx_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", hot_cold_file_global_info.file_area_refault_to_temp_age_dx);
+	return 0;
+}
+static int file_area_refault_to_temp_age_dx_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, file_area_refault_to_temp_age_dx_show, NULL);
+}
+static ssize_t file_area_refault_to_temp_age_dx_write(struct file *file,
+				const char __user *buffer, size_t count, loff_t *ppos)
+{
+    int rc;
+	unsigned int val;
+	rc = kstrtouint_from_user(buffer, count, 10,&val);
+	if (rc)
+	    return rc;
+
+    if(val < 100)
+	    hot_cold_file_global_info.file_area_refault_to_temp_age_dx = val;
+	else
+		return -EINVAL;
+
+	return count;
+}
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
+static const struct file_operations file_area_refault_to_temp_age_dx_fops = {
+    .open		= file_area_refault_to_temp_age_dx_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= file_area_refault_to_temp_age_dx_write,
+};
+#else
+static const struct proc_ops file_area_refault_to_temp_age_dx_fops = {
+    .proc_open		= file_area_refault_to_temp_age_dx_open,
+	.proc_read		= seq_read,
+	.proc_lseek		= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write		= file_area_refault_to_temp_age_dx_write,
+};
+#endif
+//file_area_temp_to_cold_age_dx
+static int file_area_temp_to_cold_age_dx_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", hot_cold_file_global_info.file_area_temp_to_cold_age_dx);
+	return 0;
+}
+static int file_area_temp_to_cold_age_dx_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, file_area_temp_to_cold_age_dx_show, NULL);
+}
+static ssize_t file_area_temp_to_cold_age_dx_write(struct file *file,
+				const char __user *buffer, size_t count, loff_t *ppos)
+{
+    int rc;
+	unsigned int val;
+	rc = kstrtouint_from_user(buffer, count, 10,&val);
+	if (rc)
+	    return rc;
+
+    if(val < 100)
+	    hot_cold_file_global_info.file_area_temp_to_cold_age_dx = val;
+	else
+		return -EINVAL;
+
+	return count;
+}
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
+static const struct file_operations file_area_temp_to_cold_age_dx_fops = {
+    .open		= file_area_temp_to_cold_age_dx_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= file_area_temp_to_cold_age_dx_write,
+};
+#else
+static const struct proc_ops file_area_temp_to_cold_age_dx_fops = {
+    .proc_open		= file_area_temp_to_cold_age_dx_open,
+	.proc_read		= seq_read,
+	.proc_lseek     = seq_lseek,
+	.proc_release	= single_release,
+	.proc_write		= file_area_temp_to_cold_age_dx_write,
+};
+#endif
+//file_area_free_age_dx
+static int file_area_free_age_dx_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", hot_cold_file_global_info.file_area_free_age_dx);
+	return 0;
+}
+static int file_area_free_age_dx_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, file_area_free_age_dx_show, NULL);
+}
+static ssize_t file_area_free_age_dx_write(struct file *file,
+				const char __user *buffer, size_t count, loff_t *ppos)
+{
+    int rc;
+	unsigned int val;
+	rc = kstrtouint_from_user(buffer, count, 10,&val);
+	if (rc)
+	    return rc;
+
+    if(val < 100)
+	    hot_cold_file_global_info.file_area_free_age_dx = val;
+	else
+		return -EINVAL;
+
+	return count;
+}
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
+static const struct file_operations file_area_free_age_dx_fops = {
+    .open		= file_area_free_age_dx_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= file_area_free_age_dx_write,
+};
+#else
+static const struct proc_ops file_area_free_age_dx_fops = {
+    .proc_open		= file_area_free_age_dx_open,
+	.proc_read		= seq_read,
+	.proc_lseek		= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write		= file_area_free_age_dx_write,
+};
+#endif
+//file_stat_delete_age_dx
+static int file_stat_delete_age_dx_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", hot_cold_file_global_info.file_stat_delete_age_dx);
+	return 0;
+}
+static int file_stat_delete_age_dx_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, file_stat_delete_age_dx_show, NULL);
+}
+static ssize_t file_stat_delete_age_dx_write(struct file *file,
+				const char __user *buffer, size_t count, loff_t *ppos)
+{
+    int rc;
+	unsigned int val;
+	rc = kstrtouint_from_user(buffer, count, 10,&val);
+	if (rc)
+	    return rc;
+
+    if(val < 100)
+	    hot_cold_file_global_info.file_stat_delete_age_dx = val;
+	else
+		return -EINVAL;
+
+	return count;
+}
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
+static const struct file_operations file_stat_delete_age_dx_fops = {
+    .open		= file_stat_delete_age_dx_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= file_stat_delete_age_dx_write,
+};
+#else
+static const struct proc_ops file_stat_delete_age_dx_fops = {
+    .proc_open		= file_stat_delete_age_dx_open,
+	.proc_read		= seq_read,
+	.proc_lseek     = seq_lseek,
+	.proc_release	= single_release,
+	.proc_write		= file_stat_delete_age_dx_write,
+};
+#endif
+//global_age_period
+static int global_age_period_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", hot_cold_file_global_info.global_age_period);
+	return 0;
+}
+static int global_age_period_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, global_age_period_show, NULL);
+}
+static ssize_t global_age_period_write(struct file *file,
+				const char __user *buffer, size_t count, loff_t *ppos)
+{
+    int rc;
+	unsigned int val;
+	rc = kstrtouint_from_user(buffer, count, 10,&val);
+	if (rc)
+	    return rc;
+
+    if(val >= 10 && val <= 60)
+	    hot_cold_file_global_info.global_age_period = val;
+	else
+		return -EINVAL;
+
+	return count;
+}
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
+static const struct file_operations global_age_period_fops = {
+    .open		= global_age_period_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= global_age_period_write,
+};
+#else
+static const struct proc_ops global_age_period_fops = {
+    .proc_open		= global_age_period_open,
+	.proc_read		= seq_read,
+	.proc_lseek     = seq_lseek,
+	.proc_release	= single_release,
+	.proc_write		= global_age_period_write,
+};
+#endif
+//open_print
+static int open_print_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", shrink_page_printk_open1);
+	return 0;
+}
+static int open_print_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, open_print_show, NULL);
+}
+static ssize_t open_print_write(struct file *file,
+				const char __user *buffer, size_t count, loff_t *ppos)
+{
+    int rc;
+	unsigned int val;
+	rc = kstrtouint_from_user(buffer, count, 10,&val);
+	if (rc)
+	    return rc;
+
+    if(val <= 1)
+	    shrink_page_printk_open1 = val;
+	else
+		return -EINVAL;
+
+	return count;
+}
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
+static const struct file_operations open_print_fops = {
+    .open		= open_print_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= open_print_write,
+};
+#else
+static const struct proc_ops open_print_fops = {
+    .proc_open		= open_print_open,
+	.proc_read		= seq_read,
+	.proc_lseek	    = seq_lseek,
+	.proc_release	= single_release,
+	.proc_write		= open_print_write,
+};
+#endif
+static int async_memory_reclaime_info_show(struct seq_file *m, void *v)
+{
+    hot_cold_file_print_all_file_stat(&hot_cold_file_global_info,m,1);
+	printk_shrink_param(&hot_cold_file_global_info,m,1);
+	return 0;
+}
+int hot_cold_file_proc_init(struct hot_cold_file_global *p_hot_cold_file_global)
+{
+    struct proc_dir_entry *p,*hot_cold_file_proc_root;
+
+    hot_cold_file_proc_root = proc_mkdir("async_memory_reclaime", NULL);
+	if(!hot_cold_file_proc_root)
+		return -1;
+
+    //proc_create("allow_dio", S_IRUGO | S_IWUSR, hot_cold_file_proc_root, &adio_fops);
+	p_hot_cold_file_global->hot_cold_file_proc_root = hot_cold_file_proc_root;
+    p = proc_create("file_area_hot_to_temp_age_dx", S_IRUGO | S_IWUSR, hot_cold_file_proc_root, &file_area_hot_to_temp_age_dx_fops);
+	if (!p){
+		printk("proc_create file_area_hot_to_temp_age_dx fail\n");
+		return -1;
+	}
+    p = proc_create("file_area_refault_to_temp_age_dx", S_IRUGO | S_IWUSR, hot_cold_file_proc_root, &file_area_refault_to_temp_age_dx_fops);
+	if (!p){
+		printk("proc_create file_area_refault_to_temp_age_dx fail\n");
+		return -1;
+	}
+    p = proc_create("file_area_temp_to_cold_age_dx", S_IRUGO | S_IWUSR, hot_cold_file_proc_root, &file_area_temp_to_cold_age_dx_fops);
+	if (!p){
+		printk("proc_create file_area_temp_to_cold_age_dx fail\n");
+		return -1;
+	}
+    p = proc_create("file_area_free_age_dx", S_IRUGO | S_IWUSR, hot_cold_file_proc_root, &file_area_free_age_dx_fops);
+	if (!p){
+		printk("proc_create file_area_free_age_dx fail\n");
+		return -1;
+	}
+    p = proc_create("file_stat_delete_age_dx", S_IRUGO | S_IWUSR, hot_cold_file_proc_root, &file_stat_delete_age_dx_fops);
+	if (!p){
+		printk("proc_create file_stat_delete_age_dx fail\n");
+		return -1;
+	}
+    p = proc_create("global_age_period", S_IRUGO | S_IWUSR, hot_cold_file_proc_root, &global_age_period_fops);
+	if (!p){
+		printk("proc_create global_age_period fail\n");
+		return -1;
+	}
+    p = proc_create("open_print", S_IRUGO | S_IWUSR, hot_cold_file_proc_root, &open_print_fops);
+	if (!p){
+		printk("proc_create open_print fail\n");
+		return -1;
+	}
+
+	p = proc_create_single("async_memory_reclaime_info", S_IRUGO, hot_cold_file_proc_root,async_memory_reclaime_info_show);
+	if (!p){
+		printk("proc_create async_memory_reclaime_info fail\n");
+		return -1;
+	}
+
+
+	return 0;
+}
+int hot_cold_file_proc_exit(struct hot_cold_file_global *p_hot_cold_file_global)
+{
+	//"file_area_hot_to_temp_age_dx"节点不存在也不会crash，自身做了防护
+	remove_proc_entry("file_area_hot_to_temp_age_dx",p_hot_cold_file_global->hot_cold_file_proc_root);
+	remove_proc_entry("file_area_refault_to_temp_age_dx",p_hot_cold_file_global->hot_cold_file_proc_root);
+	remove_proc_entry("file_area_temp_to_cold_age_dx",p_hot_cold_file_global->hot_cold_file_proc_root);
+	remove_proc_entry("file_area_free_age_dx",p_hot_cold_file_global->hot_cold_file_proc_root);
+	remove_proc_entry("file_stat_delete_age_dx",p_hot_cold_file_global->hot_cold_file_proc_root);
+	remove_proc_entry("global_age_period",p_hot_cold_file_global->hot_cold_file_proc_root);
+	remove_proc_entry("open_print",p_hot_cold_file_global->hot_cold_file_proc_root);
+
+	remove_proc_entry("async_memory_reclaime_info",p_hot_cold_file_global->hot_cold_file_proc_root);
+
+	remove_proc_entry("async_memory_reclaime",NULL);
+	return 0;
+}
+
 static inline unsigned long hot_cold_file_area_tree_shift_maxindex(unsigned int shift)
 {
 	return (TREE_MAP_SIZE << shift) - 1;
@@ -2369,7 +2806,7 @@ static void get_file_name(char *file_name_path,struct file_stat * p_file_stat)
 			dentry = hlist_entry(p_file_stat->mapping->host->i_dentry.first, struct dentry, d_u.d_alias);
 			//__dget(dentry);------这里不再__dget,因为全程有spin_lock(&inode->i_lock)加锁
 			if(dentry)
-				snprintf(file_name_path,MAX_FILE_NAME_LEN - 2,"dentry:0x%llx %s\n",(u64)dentry,dentry->d_iname);
+				snprintf(file_name_path,MAX_FILE_NAME_LEN - 2,"dentry:0x%llx %s",(u64)dentry,dentry->d_iname);
 			//dput(dentry);
         }
 		spin_unlock(&inode->i_lock);
@@ -2393,7 +2830,7 @@ static void get_file_name(char *file_name_path,struct file_stat * p_file_stat)
 	}
 }
 //遍历p_hot_cold_file_global各个链表上的file_stat的file_area个数及page个数
-int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_file_global)
+static int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_file_global,struct seq_file *m,int is_proc_print)//is_proc_print:1 通过proc触发的打印
 {
 	struct file_stat * p_file_stat;
 	unsigned int file_stat_one_file_area_count = 0,file_stat_many_file_area_count = 0;
@@ -2407,9 +2844,12 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 	}
 
 	//hot_cold_file_global->file_stat_hot_head链表
-	if(!list_empty(&p_hot_cold_file_global->file_stat_hot_head))
-	    if(shrink_page_printk_open1)
+	if(!list_empty(&p_hot_cold_file_global->file_stat_hot_head)){
+		if(is_proc_print)
+			seq_printf(m,"hot_cold_file_global->file_stat_hot_head list********\n");
+		else	
 		    printk("hot_cold_file_global->file_stat_hot_head list********\n");
+    }
 	list_for_each_entry_rcu(p_file_stat,&p_hot_cold_file_global->file_stat_hot_head,hot_cold_file_list){
 		atomic_inc(&hot_cold_file_global_info.ref_count);
 		lock_file_stat(p_file_stat,0);
@@ -2421,8 +2861,10 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 				file_stat_many_file_area_count ++;
 				get_file_name(file_name_path,p_file_stat);
 				all_pages += p_file_stat->mapping->nrpages;
-
-	            if(shrink_page_printk_open1)
+                
+				if(is_proc_print)
+					seq_printf(m,"file_stat:0x%llx max_age:%ld recent_access_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->recent_access_age,p_file_stat->file_area_count,p_file_stat->mapping->nrpages,file_name_path);
+				else	
 				    printk("file_stat:0x%llx max_age:%ld recent_access_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->recent_access_age,p_file_stat->file_area_count,p_file_stat->mapping->nrpages,file_name_path);
 			}
 			else{
@@ -2433,7 +2875,9 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 		else{
 			if(p_file_stat->file_area_count > 1){
 				file_stat_many_file_area_count ++;
-	            if(shrink_page_printk_open1)
+				if(is_proc_print)
+					seq_printf(m,"file_stat:0x%llx max_age:%ld file_area_count:%d delete\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->file_area_count);
+				else	
 				    printk("file_stat:0x%llx max_age:%ld file_area_count:%d delete\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->file_area_count);
 			}
 			else{
@@ -2445,9 +2889,12 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 	}
 
 	//hot_cold_file_global->file_stat_temp_head链表
-	if(!list_empty(&p_hot_cold_file_global->file_stat_temp_head))
-	    if(shrink_page_printk_open1)
+	if(!list_empty(&p_hot_cold_file_global->file_stat_temp_head)){
+		if(is_proc_print)
+			seq_printf(m,"hot_cold_file_global->file_stat_temp_head list********\n");
+		else	
 		    printk("hot_cold_file_global->file_stat_temp_head list********\n");
+	}
 	list_for_each_entry_rcu(p_file_stat,&p_hot_cold_file_global->file_stat_temp_head,hot_cold_file_list){
 		atomic_inc(&hot_cold_file_global_info.ref_count);
 		lock_file_stat(p_file_stat,0);
@@ -2460,7 +2907,9 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 				get_file_name(file_name_path,p_file_stat);
 				all_pages += p_file_stat->mapping->nrpages;
 
-	            if(shrink_page_printk_open1)
+				if(is_proc_print)
+					seq_printf(m,"file_stat:0x%llx max_age:%ld recent_access_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->recent_access_age,p_file_stat->file_area_count,p_file_stat->mapping->nrpages,file_name_path);
+				else	
 				    printk("file_stat:0x%llx max_age:%ld recent_access_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->recent_access_age,p_file_stat->file_area_count,p_file_stat->mapping->nrpages,file_name_path);
 			}
 			else{
@@ -2471,7 +2920,9 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 		else{
 			if(p_file_stat->file_area_count > 1){
 				file_stat_many_file_area_count ++;
-	            if(shrink_page_printk_open1)
+				if(is_proc_print)
+					seq_printf(m,"file_stat:0x%llx max_age:%ld file_area_count:%d delete\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->file_area_count);
+				else	
 				    printk("file_stat:0x%llx max_age:%ld file_area_count:%d delete\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->file_area_count);
 			}
 			else{
@@ -2483,9 +2934,12 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 	}
 
 	//hot_cold_file_global->file_stat_temp_large_file_head链表
-	if(!list_empty(&p_hot_cold_file_global->file_stat_temp_large_file_head))
-	    if(shrink_page_printk_open1)
+	if(!list_empty(&p_hot_cold_file_global->file_stat_temp_large_file_head)){
+		if(is_proc_print)
+			seq_printf(m,"hot_cold_file_global->file_stat_temp_large_file_head list********\n");
+		else	
 		    printk("hot_cold_file_global->file_stat_temp_large_file_head list********\n");
+	}
 	list_for_each_entry_rcu(p_file_stat,&p_hot_cold_file_global->file_stat_temp_large_file_head,hot_cold_file_list){
 		atomic_inc(&hot_cold_file_global_info.ref_count);
 
@@ -2499,7 +2953,9 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 				get_file_name(file_name_path,p_file_stat);
 				all_pages += p_file_stat->mapping->nrpages;
 
-	            if(shrink_page_printk_open1)
+				if(is_proc_print)
+					seq_printf(m,"file_stat:0x%llx max_age:%ld recent_access_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->recent_access_age,p_file_stat->file_area_count,p_file_stat->mapping->nrpages,file_name_path);
+				else	
 				    printk("file_stat:0x%llx max_age:%ld recent_access_age:%ld file_area_count:%d nrpages:%ld %s\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->recent_access_age,p_file_stat->file_area_count,p_file_stat->mapping->nrpages,file_name_path);
 			}
 			else{
@@ -2510,7 +2966,9 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 		else{
 			if(p_file_stat->file_area_count > 1){
 				file_stat_many_file_area_count ++;
-	            if(shrink_page_printk_open1)
+				if(is_proc_print)
+					seq_printf(m,"file_stat:0x%llx max_age:%ld file_area_count:%d delete\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->file_area_count);
+				else	
 				    printk("file_stat:0x%llx max_age:%ld file_area_count:%d delete\n",(u64)p_file_stat,p_file_stat->max_file_area_age,p_file_stat->file_area_count);
 			}
 			else{
@@ -2522,7 +2980,9 @@ int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_fi
 	}
 	all_pages += file_stat_one_file_area_pages;
 
-	if(shrink_page_printk_open1)
+	if(is_proc_print)
+		seq_printf(m,"file_stat_one_file_area_count:%d pages:%d  file_stat_many_file_area_count:%d all_pages:%d\n",file_stat_one_file_area_count,file_stat_one_file_area_pages,file_stat_many_file_area_count,all_pages);
+	else	
 	    printk("file_stat_one_file_area_count:%d pages:%d  file_stat_many_file_area_count:%d all_pages:%d\n",file_stat_one_file_area_count,file_stat_one_file_area_pages,file_stat_many_file_area_count,all_pages);
 	return 0;
 }
@@ -2622,14 +3082,14 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_cold_file_globa
 			//本周期内，该p_file_area 依然没有被访问，移动到file_area_cold链表头
 			//if(p_file_area->access_count == p_file_area->last_access_count){
 
-			//file_area经过GOLD_FILE_AREA_LEVAL个周期还没有被访问，则被判定是冷file_area，然后就释放该file_area的page
-			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > GOLD_FILE_AREA_LEVAL){
+			//file_area经过FILE_AREA_TEMP_TO_COLD_AGE_DX个周期还没有被访问，则被判定是冷file_area，然后就释放该file_area的page
+			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age >  p_hot_cold_file_global->file_area_temp_to_cold_age_dx){
 				//每遍历到一个就加一次锁，浪费性能，可以先移动到一个临时链表上，循环结束后加一次锁，然后把这些file_area或file_stat移动到目标链表??????????????
 				spin_lock(&p_file_stat->file_stat_lock);
 				//为什么file_stat_lock加锁后要再判断一次file_area是不是被访问了。因为可能有这种情况:上边的if成立，此时file_area还没被访问。但是此时有进程
 				//先执行hot_file_update_file_status()获取file_stat_lock锁，然后访问当前file_area，file_area不再冷了。当前进程此时获取file_stat_lock锁失败。
 				//等获取file_stat_lock锁成功后，file_area的file_area_age就和global_age相等了。一次，变量加减后的判断，在spin_lock前后各判断一次有必要的!!!!!!!!!!!!!!!!!!!!!!!!
-				if(p_hot_cold_file_global->global_age - p_file_area->file_area_age <= GOLD_FILE_AREA_LEVAL){
+				if(p_hot_cold_file_global->global_age - p_file_area->file_area_age <=  p_hot_cold_file_global->file_area_temp_to_cold_age_dx){
 					spin_unlock(&p_file_stat->file_stat_lock);    
 					continue;
 				}
@@ -2844,7 +3304,7 @@ unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot_cold_f
 				panic("%s file_area:0x%llx status:%d not in file_area_hot\n",__func__,(u64)p_file_area,p_file_area->file_area_state);
 
 			//file_stat->file_area_hot尾巴上长时间未被访问的file_area再降级移动回file_stat->file_area_temp链表头
-			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > GOLD_FILE_AREA_LEVAL + 3){
+			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > p_hot_cold_file_global->file_area_hot_to_temp_age_dx){
 				cold_file_area_count = 0;
 				//if(shrink_page_printk_open)
 				//    printk("2:%s %s %d p_hot_cold_file_global:0x%llx p_file_stat:0x%llx status:0x%x p_file_area:0x%llx status:0x%x in file_stat->file_area_hot\n",__func__,current->comm,current->pid,(u64)p_hot_cold_file_global,(u64)p_file_stat,p_file_stat->file_stat_status,(u64)p_file_area,p_file_area->file_area_state);
@@ -2885,7 +3345,7 @@ unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot_cold_f
 				continue;
 			}
 			//如果file_stat->file_area_free链表上的file_area长时间没有被访问则释放掉file_area结构
-			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > GOLD_FILE_AREA_LEVAL + 5){
+			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > p_hot_cold_file_global->file_area_free_age_dx){
 				file_area_free_count ++;
 				//if(shrink_page_printk_open)
 				//    printk("3:%s %s %d p_hot_cold_file_global:0x%llx p_file_stat:0x%llx status:0x%x p_file_area:0x%llx status:0x%x in file_stat->file_area_free\n",__func__,current->comm,current->pid,(u64)p_hot_cold_file_global,(u64)p_file_stat,p_file_stat->file_stat_status,(u64)p_file_area,p_file_area->file_area_state);
@@ -2911,7 +3371,7 @@ unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot_cold_f
 				panic("%s file_area:0x%llx status:%d not in file_area_refault\n",__func__,(u64)p_file_area,p_file_area->file_area_state);
 
 			//file_stat->file_area_hot尾巴上长时间未被访问的file_area再降级移动回file_stat->file_area_temp链表头
-			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > GOLD_FILE_AREA_LEVAL + 3){
+			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age >  p_hot_cold_file_global->file_area_refault_to_temp_age_dx){
 				file_area_refault_to_temp_list_count ++;
 				//if(shrink_page_printk_open)
 				//    printk("4:%s %s %d p_hot_cold_file_global:0x%llx p_file_stat:0x%llx status:0x%x p_file_area:0x%llx status:0x%x in file_stat->file_area_refault\n",__func__,current->comm,current->pid,(u64)p_hot_cold_file_global,(u64)p_file_stat,p_file_stat->file_stat_status,(u64)p_file_area,p_file_area->file_area_state);
@@ -2972,14 +3432,24 @@ unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot_cold_f
 		printk("5:%s %s %d p_hot_cold_file_global:0x%llx free_pages:%d isolate_lru_pages:%d file_stat_temp_head:0x%llx file_area_free_count:%d file_area_refault_to_list_temp_count:%d file_area_hot_to_temp_list_count:%d\n",__func__,current->comm,current->pid,(u64)p_hot_cold_file_global,free_pages,isolate_lru_pages,(u64)file_stat_temp_head,file_area_free_count,file_area_refault_to_temp_list_count,file_area_hot_to_temp_list_count);
 	return free_pages;
 }
-static void printk_shrink_param(struct hot_cold_file_global *p_hot_cold_file_global)
+static void printk_shrink_param(struct hot_cold_file_global *p_hot_cold_file_global,struct seq_file *m,int is_proc_print)
 {
 	struct hot_cold_file_shrink_counter *p = &p_hot_cold_file_global->hot_cold_file_shrink_counter;
 
-	if(shrink_page_printk_open1){
-	    printk("scan_file_area_count:%d scan_file_stat_count:%d scan_delete_file_stat_count:%d scan_cold_file_area_count:%d scan_large_to_small_count:%d scan_fail_file_stat_count:%d file_area_refault_to_temp_list_count:%d file_area_free_count:%d file_area_hot_to_temp_list_count:%d---%d\n",p->scan_file_area_count,p->scan_file_stat_count,p->scan_delete_file_stat_count,p->scan_cold_file_area_count,p->scan_large_to_small_count,p->scan_fail_file_stat_count,p->file_area_refault_to_temp_list_count,p->file_area_free_count,p->file_area_hot_to_temp_list_count,p->file_area_hot_to_temp_list_count2);
+	if(is_proc_print){
+	    seq_printf(m,"scan_file_area:%d scan_file_stat:%d scan_delete_file_stat:%d scan_cold_file_area:%d scan_large_to_small:%d scan_fail_file_stat:%d file_area_refault_to_temp:%d file_area_free:%d file_area_hot_to_temp:%d-%d\n",p->scan_file_area_count,p->scan_file_stat_count,p->scan_delete_file_stat_count,p->scan_cold_file_area_count,p->scan_large_to_small_count,p->scan_fail_file_stat_count,p->file_area_refault_to_temp_list_count,p->file_area_free_count,p->file_area_hot_to_temp_list_count,p->file_area_hot_to_temp_list_count2);
 
-	    printk("isolate_lru_pages:%d del_file_stat_count:%d del_file_area_count:%d lock_fail_count:%d writeback_count:%d dirty_count:%d page_has_private_count:%d mapping_count:%d free_pages_count:%d free_pages_fail_count:%d scan_zero_file_area_file_stat_count:%d page_unevictable_count:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count,p->scan_zero_file_area_file_stat_count,p->page_unevictable_count);
+	    seq_printf(m,"isolate_pages:%d del_file_stat:%d del_file_area:%d lock_fail_count:%d writeback:%d dirty:%d page_has_private:%d mapping:%d free_pages:%d free_pages_fail:%d scan_zero_file_area_file_stat_count:%d unevictable:%d lru_lock_contended:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count,p->scan_zero_file_area_file_stat_count,p->page_unevictable_count,p->lru_lock_contended_count);
+	
+	    seq_printf(m,"0x%llx age:%ld file_stat_count:%d file_stat_hot:%d file_stat_zero_file_area:%d\n",(u64)p_hot_cold_file_global,p_hot_cold_file_global->global_age,p_hot_cold_file_global->file_stat_count,p_hot_cold_file_global->file_stat_hot_count,p_hot_cold_file_global->file_stat_count_zero_file_area);
+	}
+	else
+	{
+	    printk("scan_file_area_count:%d scan_file_stat_count:%d scan_delete_file_stat_count:%d scan_cold_file_area_count:%d scan_large_to_small_count:%d scan_fail_file_stat_count:%d file_area_refault_to_temp_list_count:%d file_area_free_count:%d file_area_hot_to_temp_list_count:%d-%d\n",p->scan_file_area_count,p->scan_file_stat_count,p->scan_delete_file_stat_count,p->scan_cold_file_area_count,p->scan_large_to_small_count,p->scan_fail_file_stat_count,p->file_area_refault_to_temp_list_count,p->file_area_free_count,p->file_area_hot_to_temp_list_count,p->file_area_hot_to_temp_list_count2);
+
+	    printk("isolate_lru_pages:%d del_file_stat_count:%d del_file_area_count:%d lock_fail_count:%d writeback_count:%d dirty_count:%d page_has_private_count:%d mapping_count:%d free_pages_count:%d free_pages_fail_count:%d scan_zero_file_area_file_stat_count:%d unevictable:%d lru_lock_contended:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count,p->scan_zero_file_area_file_stat_count,p->page_unevictable_count,p->lru_lock_contended_count);
+	
+	    printk(">>>>>0x%llx global_age:%ld file_stat_count:%d file_stat_hot_count:%d file_stat_count_zero_file_area:%d<<<<<<\n",(u64)p_hot_cold_file_global,p_hot_cold_file_global->global_age,p_hot_cold_file_global->file_stat_count,p_hot_cold_file_global->file_stat_hot_count,p_hot_cold_file_global->file_stat_count_zero_file_area);
 	}
 }
 /*
@@ -3002,7 +3472,7 @@ static void file_stat_has_zero_file_area_manage(struct hot_cold_file_global *p_h
 			break;
 
 		//如果file_stat对应文件长时间不被访问杂释放掉file_stat结构，这个过程不用spin_lock(&p_hot_cold_file_global->global_lock)加锁
-		if(p_file_stat->file_area_count == 0 && p_hot_cold_file_global->global_age - p_file_stat->max_file_area_age > FILE_STAT_DELETE_AGE_DX){
+		if(p_file_stat->file_area_count == 0 && p_hot_cold_file_global->global_age - p_file_stat->max_file_area_age > p_hot_cold_file_global->file_stat_delete_age_dx){
 			cold_file_stat_delete(p_hot_cold_file_global,p_file_stat);
 			del_file_stat_count ++;
 			//0个file_area的file_stat个数减1
@@ -3095,7 +3565,7 @@ int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_file_glob
 		//同时令改文件的热file_area个数file_stat->file_area_hot_count减1
 		list_for_each_entry_safe_reverse(p_file_area,p_file_area_temp,&p_file_stat->file_area_hot,file_area_list){
 			//file_stat->file_area_hot尾巴上长时间未被访问的file_area再降级移动回file_stat->file_area_temp链表头
-			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > GOLD_FILE_AREA_LEVAL + 3){
+			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > p_hot_cold_file_global->file_area_hot_to_temp_age_dx){
 				cold_file_area_count = 0;
 				if(!file_area_in_hot_list(p_file_area))
 					panic("%s file_area:0x%llx status:%d not in file_area_hot\n",__func__,(u64)p_file_area,p_file_area->file_area_state);
@@ -3158,12 +3628,11 @@ int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_file_glob
 	file_stat_has_zero_file_area_manage(p_hot_cold_file_global);
 
 	//打印所有file_stat的file_area个数和page个数
-	hot_cold_file_print_all_file_stat(p_hot_cold_file_global);
-	//打印内存回收时统计的各个参数
-	printk_shrink_param(p_hot_cold_file_global);
-
 	if(shrink_page_printk_open1)
-	    printk(">>>>>0x%llx global_age:%ld file_stat_count:%d file_stat_hot_count:%d file_stat_count_zero_file_area:%d free_pages:%ld<<<<<<\n",(u64)p_hot_cold_file_global,p_hot_cold_file_global->global_age,p_hot_cold_file_global->file_stat_count,p_hot_cold_file_global->file_stat_hot_count,p_hot_cold_file_global->file_stat_count_zero_file_area,nr_reclaimed);
+	    hot_cold_file_print_all_file_stat(p_hot_cold_file_global,NULL,0);
+	//打印内存回收时统计的各个参数
+	if(shrink_page_printk_open1)
+	    printk_shrink_param(p_hot_cold_file_global,NULL,0);
 
 	return 0;
 }
@@ -3280,7 +3749,7 @@ static int hot_cold_file_thread(void *p){
 
 	while(1){
 		sleep_count = 0;
-		while(sleep_count ++ < MEMORY_RECLIAIM_PERIOD){
+		while(sleep_count ++ < p_hot_cold_file_global->global_age_period){
 			if (kthread_should_stop())
 				return 0;
 			msleep(1000);
@@ -3291,7 +3760,7 @@ static int hot_cold_file_thread(void *p){
 	return 0;
 }
 
-int hot_cold_file_init(void)
+static int hot_cold_file_init(void)
 {
 	int node_count,i,ret;
 	//hot_cold_file_global_info.file_stat_cachep = KMEM_CACHE(file_stat,0);
@@ -3310,6 +3779,13 @@ int hot_cold_file_init(void)
 
 	atomic_set(&hot_cold_file_global_info.ref_count,0);
 	atomic_set(&hot_cold_file_global_info.inode_del_count,0);
+
+	hot_cold_file_global_info.file_area_hot_to_temp_age_dx = FILE_AREA_HOT_to_TEMP_AGE_DX;
+	hot_cold_file_global_info.file_area_refault_to_temp_age_dx = FILE_AREA_REFAULT_TO_TEMP_AGE_DX;
+	hot_cold_file_global_info.file_area_temp_to_cold_age_dx = FILE_AREA_TEMP_TO_COLD_AGE_DX;
+	hot_cold_file_global_info.file_area_free_age_dx = FILE_AREA_FREE_AGE_DX;
+	hot_cold_file_global_info.file_stat_delete_age_dx  = FILE_STAT_DELETE_AGE_DX;
+	hot_cold_file_global_info.global_age_period = ASYNC_MEMORY_RECLIAIM_PERIOD;
 
 	//1G的page cache对应多少个file_area
 	hot_cold_file_global_info.file_area_count_for_large_file = (1024*1024*1024)/(4096 *PAGE_COUNT_IN_AREA);
@@ -3535,6 +4011,11 @@ static int __init async_memory_reclaime_for_cold_file_area_init(void)
 	if(ret < 0){
 		goto err;
 	}
+
+	ret = hot_cold_file_proc_init(&hot_cold_file_global_info);
+	if(ret < 0){
+		goto err;
+	}
 	return 0;
 err:
 	/*if(kp_mark_page_accessed.post_handler)
@@ -3551,6 +4032,7 @@ err:
 	if(hot_cold_file_global_info.hot_cold_file_thead)
 		kthread_stop(hot_cold_file_global_info.hot_cold_file_thead);
 
+	hot_cold_file_proc_exit(&hot_cold_file_global_info);
 	return ret;
 }
 static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
@@ -3579,6 +4061,7 @@ static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
 	kmem_cache_destroy(hot_cold_file_global_info.file_stat_cachep);
 	kmem_cache_destroy(hot_cold_file_global_info.file_area_cachep);
 	kmem_cache_destroy(hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep);
+	hot_cold_file_proc_exit(&hot_cold_file_global_info);
 }
 module_init(async_memory_reclaime_for_cold_file_area_init);
 module_exit(async_memory_reclaime_for_cold_file_area_exit);
