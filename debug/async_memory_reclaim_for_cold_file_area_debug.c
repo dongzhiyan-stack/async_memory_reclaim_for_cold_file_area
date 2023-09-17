@@ -334,7 +334,7 @@ enum file_area_status{//file_area_state是char类型，只有8个bit位可设置
 	F_file_area_in_refault_list,
 	F_file_area_in_cache,//file_area保存在ile_stat->hot_file_area_cache[]数组里
 };
-//不能使用 clear_bit、set_bit、test_bit，因为要求p_file_area->file_area_state是64位数据，但实际只是u8型数据
+//不能使用 clear_bit_unlock、test_and_set_bit_lock、test_bit，因为要求p_file_area->file_area_state是64位数据，但实际只是u8型数据
 
 #define MAX_FILE_AREA_LIST_BIT F_file_area_in_refault_list
 #define FILE_AREA_LIST_MASK ((1 << (MAX_FILE_AREA_LIST_BIT + 1)) - 1)
@@ -401,7 +401,7 @@ enum file_stat_status{//file_area_state是long类型，只有64个bit位可设�
 	F_file_stat_lock,
 	F_file_stat_lock_not_block,//这个bit位置1，说明inode在删除的，但是获取file_stat锁失败
 };
-//不能使用 clear_bit、set_bit、test_bit，因为要求p_file_stat->file_stat_status是64位数据，但这里只是u8型数据
+//不能使用 clear_bit_unlock、test_and_set_bit_lock、test_bit，因为要求p_file_stat->file_stat_status是64位数据，但这里只是u8型数据
 
 #define MAX_FILE_STAT_LIST_BIT F_file_stat_in_free_page_done
 #define FILE_STAT_LIST_MASK ((1 << (MAX_FILE_STAT_LIST_BIT + 1)) - 1)
@@ -461,11 +461,14 @@ FILE_STATUS(drop_cache)
 //清理文件的状态，大小文件等
 #define CLEAR_FILE_STATUS_ATOMIC(name)\
     static inline void clear_file_stat_in_##name(struct file_stat *p_file_stat)\
-    {clear_bit(F_file_stat_in_##name,&p_file_stat->file_stat_status);}
+    {clear_bit_unlock(F_file_stat_in_##name,&p_file_stat->file_stat_status);}
 //设置文件的状态，大小文件等
 #define SET_FILE_STATUS_ATOMIC(name)\
     static inline void set_file_stat_in_##name(struct file_stat *p_file_stat)\
-    {set_bit(F_file_stat_in_##name,&p_file_stat->file_stat_status);}
+    {if(test_and_set_bit_lock(F_file_stat_in_##name,&p_file_stat->file_stat_status)) \
+		/*如果这个file_stat的bit位被多进程并发设置，不可能,应该发生了某种异常，触发crash*/  \
+	    panic("file_stat:0x%llx status:0x%lx alreay set %d bit\n",(u64)p_file_stat,p_file_stat->file_stat_status,F_file_stat_in_##name); \
+	}
 //测试文件的状态，大小文件等
 #define TEST_FILE_STATUS_ATOMIC(name)\
     static inline int file_stat_in_##name(struct file_stat *p_file_stat)\
@@ -479,12 +482,12 @@ FILE_STATUS(drop_cache)
 	SET_FILE_STATUS_ATOMIC(name) \
 	TEST_FILE_STATUS_ATOMIC(name) \
 	TEST_FILE_STATUS_ATOMIC_ERROR(name) \
-/* 为什么 file_stat的in_free_page、free_page_done的状态要使用set_bit/clear_bit，主要是get_file_area_from_file_stat_list()函数开始内存回收，
+/* 为什么 file_stat的in_free_page、free_page_done的状态要使用test_and_set_bit_lock/clear_bit_unlock，主要是get_file_area_from_file_stat_list()函数开始内存回收，
  * 要把file_stat设置成in_free_page状态，此时hot_file_update_file_status()里就不能再把这些file_stat的file_area跨链表移动。而把file_stat设置成
  * in_free_page状态，只是加了global global_lock锁，没有加file_stat->file_stat_lock锁。没有加锁file_stat->file_stat_lock锁，就无法避免
  * hot_file_update_file_status()把把这些file_stat的file_area跨链表移动。因此，file_stat的in_free_page、free_page_done的状态设置要考虑原子操作吧，
  * 并且此时要避免此时有进程在执行hot_file_update_file_status()函数。这些在hot_file_update_file_status()和get_file_area_from_file_stat_list()函数
- * 有说明其实file_stat设置in_free_page、free_page_done 状态都有spin lock加锁，不使用set_bit、clear_bit也行，目前暂定先用set_bit、clear_bit吧，
+ * 有说明其实file_stat设置in_free_page、free_page_done 状态都有spin lock加锁，不使用test_and_set_bit_lock、clear_bit_unlock也行，目前暂定先用test_and_set_bit_lock、clear_bit_unlock吧，
  * 后续再考虑其他优化*/
 FILE_STATUS_ATOMIC(free_page)
 FILE_STATUS_ATOMIC(free_page_done)
@@ -543,17 +546,20 @@ static inline void lock_file_stat(struct file_stat * p_file_stat,int not_block){
 	//如果有其他进程对file_stat的lock加锁，while成立，则休眠等待这个进程释放掉lock，然后自己加锁
 	while(test_and_set_bit_lock(F_file_stat_lock, &p_file_stat->file_stat_status)){
 		if(not_block){//if成立说明inode在删除的，但是获取file_stat锁失败，此时正获取file_stat锁的进程要立即释放掉file_stat锁
-		    set_bit(F_file_stat_lock_not_block,&p_file_stat->file_stat_status);
+		    if(test_and_set_bit_lock(F_file_stat_lock_not_block,&p_file_stat->file_stat_status)){
+				//F_file_stat_lock_not_block这个bit位可能被多进程并发设置，如果已经被设置了，先不考虑触发crash
+		        //panic("file_stat:0x%llx status:0x%x alreay set stat_lock_not_block\n",(u64)p_file_stat,p_file_stat->file_stat_status);
+			}
+			not_block = 0;
 		}
-		/*其实好点是每个file_stat都有休眠等待队列，进程获取file_stat失败则再休眠等待队列休眠，而不是直接msleep，后期改进吧??????????????????????????*/
+		/*其实好点是每个file_stat都有休眠等待队列，进程获取file_stat失败则再休眠等待队列休眠，而不是直接msleep，后期改进吧?????*/
 		msleep(1);
 		//dump_stack();
 	}
 }
 static inline void unlock_file_stat(struct file_stat * p_file_stat){
-	if(test_bit(F_file_stat_lock_not_block,&p_file_stat->file_stat_status)){
-	    clear_bit(F_file_stat_lock_not_block,&p_file_stat->file_stat_status);
-	}
+	//如果file_stat被设置了not_block标记，则要先清理掉
+	test_and_clear_bit(F_file_stat_lock_not_block,&p_file_stat->file_stat_status);
 	clear_bit_unlock(F_file_stat_lock, &p_file_stat->file_stat_status);
 }
 
@@ -2196,12 +2202,15 @@ static ssize_t async_drop_caches_write(struct file *file,
 		return -EBUSY;
 	}
 
-	//把async_memory_reclaim_status的bit1置1，说明在进行异步drop_cache处理，分配文件file_stat添加到global drop_cache_file_stat_head链表，
-	//此时禁止异步内存回收线程处理global drop_cache_file_stat_head链表上的file_stat。防止并发操作
-    set_bit(ASYNC_DROP_CACHES, &async_memory_reclaim_status);
+    /*把async_memory_reclaim_status的bit1置1，说明在进行异步drop_cache处理，分配文件file_stat添加到global drop_cache_file_stat_head链表，
+	  此时禁止异步内存回收线程处理global drop_cache_file_stat_head链表上的file_stat。防止并发操作*/
+    if(test_and_set_bit_lock(ASYNC_DROP_CACHES, &async_memory_reclaim_status))
+		//ASYNC_DROP_CACHES这个bit位不可能被多进程并发设置，如果已经被设置了，应该发生了某种异常，触发crash
+	    panic("async_memory_reclaim_status:0x%lx alreay set ASYNC_DROP_CACHES\n",async_memory_reclaim_status);
+
     iterate_supers_async();
 	//异步drop_cache处理完了，清0。此时不会再向global drop_cache_file_stat_head链表添加新的file_stat。此时异步内存回收线程可以处理该链表上的file_stat了。
-    clear_bit(ASYNC_DROP_CACHES, &async_memory_reclaim_status);
+    clear_bit_unlock(ASYNC_DROP_CACHES, &async_memory_reclaim_status);
 	return count;
 }
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
@@ -3187,20 +3196,22 @@ static int hot_file_update_file_status(struct page *page)
 		struct file_area *p_file_area = NULL; 
 		int i;
 
-		//async_memory_reclaim_status不再使用smp_rmb内存屏障，而直接使用set_bit/clear_bit原子操作
+		//async_memory_reclaim_status不再使用smp_rmb内存屏障，而直接使用test_and_set_bit_lock/clear_bit_unlock原子操作
 		if(!test_bit(ASYNC_MEMORY_RECLAIM_ENABLE,&async_memory_reclaim_status))
 			return 0;
 
 		atomic_inc(&hot_cold_file_global_info.ref_count);
+		/*1:与 __destroy_inode_handler_post()函数mapping->rh_reserved1清0的smp_wmb()成对，获取最新的mapping->rh_reserved1数据.
+		 *2:还有一个作用，上边的ref_count原子变量加1可能不能禁止编译器重排序，因此这个内存屏障可以防止reorder*/
+		smp_rmb();
 
 		/*还要再判断一次async_memory_reclaim_status是否是0，因为驱动卸载会先获取原子变量ref_count的值0，然后这里再执行
 		 *atomic_inc(&hot_cold_file_global_info.ref_count)令ref_count加1.这种情况必须判断async_memory_reclaim_status是0，
 		 *直接return返回。否则驱动卸载过程会释放掉file_stat结构，然后该函数再使用这个file_stat结构，触发crash*/
 		if(!test_bit(ASYNC_MEMORY_RECLAIM_ENABLE,&async_memory_reclaim_status))
 			goto out;
-
-		//与 __destroy_inode_handler_post()函数mapping->rh_reserved1清0的smp_wmb()成对，详细看注释
-		smp_rmb();
+        
+		//smp_rmb();这个内存屏障移动到前边
 		//如果两个进程同时访问同一个文件的page0和page1，这就就有问题了，因为这个if会同时成立。然后下边针对
 		if(mapping->rh_reserved1 == 0 ){
 
@@ -3604,6 +3615,7 @@ already_alloc:
 			panic("p_file_area->file_area_age:%ld > hot_cold_file_global_info.global_age:%ld\n",p_file_area->file_area_age,hot_cold_file_global_info.global_age);
 
 out:
+		//这个原子操作目前看没必要防止重排序
 		atomic_dec(&hot_cold_file_global_info.ref_count);
 		/*不能因为走了err分支，就释放p_file_stat和p_file_area结构。二者都已经添加到ot_file_global_info.file_stat_hot_head 或 
 		 * p_file_stat->file_area_temp链表，不能释放二者的数据结构。是这样吗，得再考虑一下?????????????*/
@@ -4923,6 +4935,9 @@ static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 		if(test_bit(ASYNC_MEMORY_RECLAIM_ENABLE,&async_memory_reclaim_status))
 		{
 			atomic_inc(&hot_cold_file_global_info.inode_del_count);
+			/*1:获取最新的inode->i_mapping->rh_reserved1值，如果是0说明文件file_stat已经释放，直接return
+			 *2:上边的inode_del_count原子变量加1可能不能禁止编译器重排序，因此这个内存屏障可以防止reorder*/
+			smp_rmb();
 
 			/*如果该inode被地方后，不用立即把inode->mapping对应的file_stat立即加锁释放掉。因为即便这个inode被释放后立即又被其他进程分配，
 			  但分配后会先对inode清0，inode->mapping 和 inode->mapping->rh_reserved1 全是0，不会受inode->mapping->rh_reserved1指向的老file_stat
@@ -4943,7 +4958,7 @@ static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 					return;
 				}
 #else*/
-				smp_rmb();
+				//smp_rmb();这个内存屏障移动到了上边
 				//如果file_stat在cold_file_stat_delete()中被释放了，会把inode->i_mapping->rh_reserved1清0，这里不再使用file_stat
 				if(0 == inode->i_mapping->rh_reserved1){
 			        atomic_dec(&hot_cold_file_global_info.inode_del_count);
@@ -4995,6 +5010,8 @@ static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 				atomic_dec(&hot_cold_file_global_info.inode_del_count);
 				goto file_stat_delete;
 			}
+			//inode_del_count减1的操作操作不能禁止reorder，这里加个内存屏障是确保与上边的unlock_file_stat(p_file_stat)操作隔开
+			smp_mb__before_atomic();
 			atomic_dec(&hot_cold_file_global_info.inode_del_count);
 		}
 		else
@@ -5093,10 +5110,10 @@ static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
 	//这里是重点，先等异步内存回收线程结束运行，就不会再使用任何的file_stat了，此时可以放心执行下边的cold_file_delete_all_file_stat()释放所有文件的file_stat
 	kthread_stop(hot_cold_file_global_info.hot_cold_file_thead);
 
-	//为使用 clear_bit()把async_memory_reclaim_status清0，这样使用async_memory_reclaim_status的地方不用再smp_rmb获取最的async_memory_reclaim_status值0
+	//为使用 clear_bit_unlock()把async_memory_reclaim_status清0，这样使用async_memory_reclaim_status的地方不用再smp_rmb获取最的async_memory_reclaim_status值0
 	//async_memory_reclaim_status = 0;
 	//smp_wmb();
-	clear_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status);//驱动卸载，把async_memory_reclaim_status清0
+	clear_bit_unlock(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status);//驱动卸载，把async_memory_reclaim_status清0
 
 	//如果还有进程在访问file_stat和file_area，p_hot_cold_file_global->ref_count大于0，则先休眠
 	while(atomic_read(&hot_cold_file_global_info.ref_count)){
