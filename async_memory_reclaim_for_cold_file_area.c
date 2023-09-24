@@ -444,7 +444,7 @@ FILE_STAT_STATUS(zero_file_area)
 	TEST_FILE_STATUS_ERROR(name)
 
 FILE_STATUS(large_file)
-FILE_STATUS(delete)
+//FILE_STATUS(delete)
 FILE_STATUS(drop_cache)
 
 //清理文件的状态，大小文件等
@@ -476,10 +476,11 @@ FILE_STATUS(drop_cache)
  * in_free_page状态，只是加了global global_lock锁，没有加file_stat->file_stat_lock锁。没有加锁file_stat->file_stat_lock锁，就无法避免
  * hot_file_update_file_status()把把这些file_stat的file_area跨链表移动。因此，file_stat的in_free_page、free_page_done的状态设置要考虑原子操作吧，
  * 并且此时要避免此时有进程在执行hot_file_update_file_status()函数。这些在hot_file_update_file_status()和get_file_area_from_file_stat_list()函数
- * 有说明其实file_stat设置in_free_page、free_page_done 状态都有spin lock加锁，不使用test_and_set_bit_lock、clear_bit_unlock也行，目前暂定先用test_and_set_bit_lock、clear_bit_unlock吧，
- * 后续再考虑其他优化*/
+ * 有说明其实file_stat设置in_free_page、free_page_done 状态都有spin lock加锁，不使用test_and_set_bit_lock、clear_bit_unlock也行，
+ * 目前暂定先用test_and_set_bit_lock、clear_bit_unlock吧，后续再考虑其他优化*/
 FILE_STATUS_ATOMIC(free_page)
 FILE_STATUS_ATOMIC(free_page_done)
+FILE_STATUS_ATOMIC(delete)
 
 
 /*因为buffer io write的page不会调用到mark_page_accessed()，因此考虑kprobe pagecache_get_page。但是分析generic_file_buffered_read()源码，有概率
@@ -1575,7 +1576,7 @@ static unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_
 	//对file_stat加锁
 	lock_file_stat(p_file_stat,0);
 	//如果文件inode和mapping已经释放了，则不能再使用mapping了，必须直接return
-	if(NULL == p_file_stat->mapping || file_stat_in_delete(p_file_stat))
+	if(file_stat_in_delete(p_file_stat) || (NULL == p_file_stat->mapping))
 		goto err;
 	mapping = p_file_stat->mapping;
 
@@ -1608,7 +1609,7 @@ static unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_
 		}
 		/*如果在遍历file_stat的file_area过程，__destroy_inode_handler_post()里释放该file_stat对应的inode和mapping，则对file_stat加锁前先
 		 *p_file_stat->mapping =NULL.然后这里立即goto err并释放file_stat锁，最后__destroy_inode_handler_post()可以立即获取file_stat锁*/
-		if(NULL == p_file_stat->mapping){
+		if(file_stat_in_delete(p_file_stat) || (NULL == p_file_stat->mapping)){
 			printk("file_stat:0x%llx inode already delete\n",(u64)p_file_stat);
 			goto err;
         }
@@ -2230,7 +2231,7 @@ static int drop_cache_truncate_inode_pages(struct hot_cold_file_global *p_hot_co
 			 * delete标记，然后删除掉file_stat。并且，如果inode引用计数是0，说明inode马上也要被释放了，没人用了，这种文件file_stat也跳过
 			 * 不处理*/
 			lock_file_stat(p_file_stat,0);
-			if(NULL == p_file_stat->mapping || atomic_read(&p_file_stat->mapping->host->i_count) == 0){
+			if(file_stat_in_delete(p_file_stat) || atomic_read(&p_file_stat->mapping->host->i_count) == 0){
 unsed_inode:	
 				/*可能其他进程__destroy_inode_handler_post()正在删除inode，标记file_stat删除，这里先等那些进程全都退出__destroy_inode_handler_post函数。
 				 *否则，这里强行使用 p_file_stat->mapping->rh_reserved1会crash，因为mapping对应的inode可能被释放了*/
@@ -2243,10 +2244,14 @@ unsed_inode:
 				if(p_file_stat->mapping){
 					//这个释放file_stat的操作与 __destroy_inode_handler_post()函数一样
 				    p_file_stat->mapping->rh_reserved1 = 0;
+					barrier();
 				    p_file_stat->mapping = NULL;
+					smp_wmb();//在这个加个内存屏障，保证前后代码隔离开。即file_stat有delete标记后，inode->i_mapping->rh_reserved1一定是0，p_file_stat->mapping一定是NULL
 				}
-				set_file_stat_in_delete(p_file_stat);
-			    smp_wmb();
+				//file_stat可能在__destroy_inode_handler_post删除inode时已经标记了file_stat delete，这里不再重复操作，否则会crash
+				if(0 == file_stat_in_delete(p_file_stat))
+				    set_file_stat_in_delete(p_file_stat);
+			    //smp_wmb();---set_file_stat_in_delete()现在改成 test_and_set_bit_lock原子操作设置，并且有内促屏障，这个smp_wmb就不需要了
 
 	            hot_cold_file_global_info.drop_cache_file_count --;
 				clear_file_stat_in_drop_cache(p_file_stat);
@@ -2330,7 +2335,7 @@ static void file_stat_free_leak_page(struct hot_cold_file_global *p_hot_cold_fil
 	//file_stat加锁，防止此时inode并发被删除了。如果删除了则p_file_stat->mapping 是NULL，直接return
 	//并且，如果inode引用计数是0，说明inode马上也要被释放了，没人用了，这种文件file_stat也跳过不处理
 	lock_file_stat(p_file_stat,0);
-    if(NULL == p_file_stat->mapping || atomic_read(&p_file_stat->mapping->host->i_count) == 0){
+    if(file_stat_in_delete(p_file_stat) || (NULL == p_file_stat->mapping) || atomic_read(&p_file_stat->mapping->host->i_count) == 0){
         unlock_file_stat(p_file_stat);
 		return;
 	}
@@ -2905,13 +2910,15 @@ static void inline cold_file_stat_delete(struct hot_cold_file_global *p_hot_cold
 	 * p_file_stat->mapping->rh_reserved1，此时同样也会因file_stat已经释放而crash
 	 * */
 	lock_file_stat(p_file_stat_del,0);
-	if(p_file_stat_del->mapping){
+	/*如果file_stat在__destroy_inode_handler_post中被释放了，file_stat一定有delete标记。否则没有delete标记，这里先标记file_stat的delete*/
+	if(0 == file_stat_in_delete(p_file_stat_del)/*p_file_stat_del->mapping*/){
 		//文件inode的mapping->rh_reserved1清0表示file_stat无效，这__destroy_inode_handler_post()删除inode时，发现inode的mapping->rh_reserved1是0就不再使用file_stat了，会crash
 		p_file_stat_del->mapping->rh_reserved1 = 0;
+		barrier();
 		p_file_stat_del->mapping = NULL;
+		smp_wmb();//在这个加个内存屏障，保证前后代码隔离开。即file_stat有delete标记后，inode->i_mapping->rh_reserved1一定是0，p_file_stat->mapping一定是NULL
+		set_file_stat_in_delete(p_file_stat_del);
 	}
-	//下边的spin_unlock有内存屏障操作吗？算了，这里主动调用一下
-	smp_wmb();
 	unlock_file_stat(p_file_stat_del);
 
 	//如果有进程正在"hot_file_update_file_status()访问file_stat"，会用到file_stat，则这里先休眠等待它用完file_stat再释放file_stat，二者可能用的是同一个file_stat
@@ -2925,10 +2932,12 @@ static void inline cold_file_stat_delete(struct hot_cold_file_global *p_hot_cold
 
 	//使用global_lock加锁是因为要把file_stat从p_hot_cold_file_global的链表中剔除，防止此时其他进程并发向p_hot_cold_file_global的链表添加file_stat
 	spin_lock(&p_hot_cold_file_global->global_lock);
+#if 0//这两个操作移动到上边的lock_file_stat里了，因为有 lock_file_stat 加锁防护
 	//释放file_stat后，必须要把p_file_stat->mapping清NULL
 	p_file_stat_del->mapping = NULL;
 	//主动删除的file_stat也要标记delete，防止这个已经被释放file_stat在hot_file_update_file_status()里被再次使用，会因file_stat有delete标记而触发crash
 	set_file_stat_in_delete(p_file_stat_del);
+#endif	
 	//从global的链表中剔除该file_stat，这个过程需要加锁，因为同时其他进程会执行hot_file_update_file_status()向global的链表添加新的文件file_stat
 	list_del(&p_file_stat_del->hot_cold_file_list);
 	//释放该file_stat结构
@@ -4514,13 +4523,14 @@ static int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_fi
   这个file_stat，但这个file_stat已经delete了，将发生crash*/
 static void cold_file_disable_file_stat_mapping(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat)
 {
+	/*这是驱动卸载过程，但是此时也会并发有进程删除inode而执行__destroy_inode_handler_post()函数。但是这种情况走的else分支，二者都有
+	 * spin_lock(&p_hot_cold_file_global->global_lock)加锁防护，不用担心担心并发问题*/
 	spin_lock(&p_hot_cold_file_global->global_lock);
 	//if(p_file_stat->mapping->rh_reserved1) 不能通过p_file_stat->mapping->rh_reserved1是否0来判断file_stat的文件inode是否释放了，因为之后inode和mapping都是无效的
 	if(p_file_stat->mapping){
 		p_file_stat->mapping->rh_reserved1 = 0;
-		/*把最新的rh_reserved1赋值同步给其他cpu，主要设置同时给执行__destroy_inode_handler_post()函数的进程，告诉它
-		 *p_file_stat->mapping->rh_reserved1已经清0了。spin lock也需要加smp_wmb()，__destroy_inode_handler_post()函数不一定加锁*/
-		smp_wmb();
+		/*此时会并发有进程执行__destroy_inode_handler_post()函数，但是二者都有global_lock加锁防护，以内不用再加内存屏障*/
+		//smp_wmb();
 	}
 	spin_unlock(&p_hot_cold_file_global->global_lock);
 }
@@ -4644,6 +4654,11 @@ static int hot_cold_file_init(void)
 	hot_cold_file_global_info.file_area_cachep = kmem_cache_create("file_area",sizeof(struct file_area),0,0,NULL);
 	hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep = kmem_cache_create("hot_cold_file_area_tree_node",sizeof(struct hot_cold_file_area_tree_node),0,0,NULL);
 
+	if(!hot_cold_file_global_info.file_stat_cachep || !hot_cold_file_global_info.file_area_cachep || !hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep){
+	    printk("%s slab 0x%llx 0x%llx 0x%llx error\n",__func__,(u64)hot_cold_file_global_info.file_stat_cachep,(u64)hot_cold_file_global_info.file_area_cachep,(u64)hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep);
+		return -1;
+	}
+	
 	INIT_LIST_HEAD(&hot_cold_file_global_info.file_stat_hot_head);
 	INIT_LIST_HEAD(&hot_cold_file_global_info.file_stat_temp_head);
 	INIT_LIST_HEAD(&hot_cold_file_global_info.file_stat_temp_large_file_head);
@@ -4763,7 +4778,11 @@ static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 			if(test_bit(ASYNC_MEMORY_RECLAIM_ENABLE,&async_memory_reclaim_status) && inode->i_mapping->rh_reserved1){
 				//smp_rmb();这个内存屏障移动到了上边
 
-				//如果file_stat在cold_file_stat_delete()中被释放了，会把inode->i_mapping->rh_reserved1清0，这里不再使用file_stat
+				/*如果file_stat在cold_file_stat_delete()中被释放了，会把inode->i_mapping->rh_reserved1清0，这里不再使用file_stat。注意，这里不能再使用
+				 * file_stat_in_delete(p_file_stat)判断file_stat已经被cold_file_stat_delete()标记delete，因为此时file_stat结构体已经被释放了，这里
+				 * 就不能再操作file_stat。cold_file_stat_delete()中释放file_stat前，会先标记inode->i_mapping->rh_reserved1清0，然后等
+				 * inode_del_count原子变量是0，即所有执行__destroy_inode_handler_post()的进程退出，然后再释放file_stat结构。此时新的进程再执行
+				 * __destroy_inode_handler_post()，inode->i_mapping->rh_reserved1已经是0了，这里就直接return，不会再使用这个已经释放掉的file_stat结构*/
 				if(0 == inode->i_mapping->rh_reserved1){
 			        atomic_dec(&hot_cold_file_global_info.inode_del_count);
 					return;
@@ -4785,12 +4804,15 @@ static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 				 *立即被其他进程分配了这个inode，但是没有对inode清0，导致inode->i_mapping->rh_reserved1还保存着老的已经释放的file_stat，
 				  因为inode->i_mapping->rh_reserved1不是0，不对这个file_stat初始化，然后把file_area添加到这个无效file_stat，就要crash。*/
 				inode->i_mapping->rh_reserved1 = 0;
+				barrier();
 				p_file_stat->mapping = NULL;
+				smp_wmb();//在这个加个内存屏障，保证前后代码隔离开。即file_stat有delete标记后，inode->i_mapping->rh_reserved1一定是0，p_file_stat->mapping一定是NULL
+
 				/*这里有个很大的隐患，此时file_stat可能处于global file_stat_hot_head、file_stat_temp_head、file_stat_temp_large_file_head 
 				 *3个链表，这里突然设置set_file_stat_in_delete，将来这些global 链表遍历这个file_stat，发现没有 file_stat_in_file_stat_hot_head
 				  等标记，会主动触发panic()。不对，set_file_stat_in_delete并不会清理原有的file_stat_in_file_stat_hot_head等标记，杞人忧天了。*/
 				set_file_stat_in_delete(p_file_stat);
-				smp_wmb(); 
+				//smp_wmb();----set_file_stat_in_delete()现在改成 test_and_set_bit_lock原子操作设置，并且有内促屏障，这个smp_wmb就不需要了
 
 				unlock_file_stat(p_file_stat);
 	            if(shrink_page_printk_open1)
@@ -4829,11 +4851,17 @@ file_stat_delete:
 			}
 			p_file_stat = (struct file_stat *)(inode->i_mapping->rh_reserved1);
 			if(inode->i_mapping->rh_reserved1 && inode->i_mapping == p_file_stat->mapping){
-
 				p_file_stat->mapping->rh_reserved1 = 0;
+				barrier();
 				//驱动卸载，释放file_stat时，遇到p_file_stat->mapping是NULL，就不再执行"p_file_stat->mapping->rh_reserved1 = 0"了，会crash
 				p_file_stat->mapping = NULL;
-				set_file_stat_in_delete(p_file_stat);
+				smp_wmb();
+				/*正常情况，走到这个分支是驱动卸载流程，这里把file_stat标记delete后，异步内存回收线程可能不会把有delete标记的file_stat从
+				 *global temp或hot或large_file链表移动到global delete链表。这样就有问题了，file_stat的状态跟它所在的链表不匹配，就会造成crash。
+				  因此这里就不再使用set_file_stat_in_delete了，通过p_file_stat->mapping是NULL也能判断file_stat已经delete。这就要求判断
+				  file_stat是否已经删除的代码里，要使用if(file_stat_in_delete(p_file_stat) || (NULL == p_file_stat->mapping))两个判断一起加上
+				  ，不能单独只使用if(file_stat_in_delete(p_file_stat)判断file_stat是否已删除!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!*/
+				//set_file_stat_in_delete(p_file_stat);---关键代码，不要删
 			}
 			spin_unlock(&hot_cold_file_global_info.global_lock);
 		}
