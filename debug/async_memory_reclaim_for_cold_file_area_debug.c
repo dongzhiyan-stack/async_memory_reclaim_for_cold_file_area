@@ -1031,6 +1031,7 @@ static spinlock_t *sb_lock_async;
 static struct list_head *super_blocks_async;
 static void (*security_sb_free_async)(struct super_block *sb);
 static void (*destroy_super_rcu_async)(struct rcu_head *head);
+static void (*cache_random_seq_destroy_async)(struct kmem_cache *cachep);
 
 /* Check if a page is dirty or under writeback */
 inline static void folio_check_dirty_writeback_async(struct folio *folio,
@@ -1606,8 +1607,9 @@ static int look_up_not_export_function(void)
 	__mem_cgroup_uncharge_list_async = (void*)kallsyms_lookup_name_async("__mem_cgroup_uncharge_list");
 	root_mem_cgroup_async = (struct mem_cgroup *)kallsyms_lookup_name_async("root_mem_cgroup");
 	compound_page_dtors_async= (compound_page_dtor *  (*)[NR_COMPOUND_DTORS])kallsyms_lookup_name_async("compound_page_dtors");
-	if(!__remove_mapping_async || !mem_cgroup_update_lru_size_async  || !free_unref_page_list_async || !__count_memcg_events_async  || !mem_cgroup_disabled_async  || !__mod_memcg_lruvec_state_async  || !putback_lru_page_async  || !try_to_unmap_flush_async  || !root_mem_cgroup_async || !compound_page_dtors_async || !__mem_cgroup_uncharge_list_async){
-		printk("!!!!!!!!!! error __remove_mapping_async:0x%llx mem_cgroup_update_lru_size_async:0x%llx free_unref_page_list_async:0x%llx __count_memcg_events_async:0x%llx mem_cgroup_disabled_async:0x%llx __mod_memcg_lruvec_state_async:0x%llx putback_lru_page_async:0x%llx try_to_unmap_flush_async:0x%llx root_mem_cgroup_async:0x%llx compound_page_dtors_async:0x%llx __mem_cgroup_uncharge_list_async:0x%llx",(u64)__remove_mapping_async,(u64)mem_cgroup_update_lru_size_async,(u64)free_unref_page_list_async ,(u64)__count_memcg_events_async ,(u64)mem_cgroup_disabled_async ,(u64)__mod_memcg_lruvec_state_async,(u64)putback_lru_page_async,(u64)try_to_unmap_flush_async ,(u64)root_mem_cgroup_async,(u64)compound_page_dtors_async,(u64)__mem_cgroup_uncharge_list_async);
+	cache_random_seq_destroy_async = (void *)kallsyms_lookup_name_async("cache_random_seq_destroy");
+	if(!__remove_mapping_async || !mem_cgroup_update_lru_size_async  || !free_unref_page_list_async || !__count_memcg_events_async  || !mem_cgroup_disabled_async  || !__mod_memcg_lruvec_state_async  || !putback_lru_page_async  || !try_to_unmap_flush_async  || !root_mem_cgroup_async || !compound_page_dtors_async || !__mem_cgroup_uncharge_list_async || !cache_random_seq_destroy_async){
+		printk("!!!!!!!!!! error __remove_mapping_async:0x%llx mem_cgroup_update_lru_size_async:0x%llx free_unref_page_list_async:0x%llx __count_memcg_events_async:0x%llx mem_cgroup_disabled_async:0x%llx __mod_memcg_lruvec_state_async:0x%llx putback_lru_page_async:0x%llx try_to_unmap_flush_async:0x%llx root_mem_cgroup_async:0x%llx compound_page_dtors_async:0x%llx __mem_cgroup_uncharge_list_async:0x%llx cache_random_seq_destroy_async:0x%llx",(u64)__remove_mapping_async,(u64)mem_cgroup_update_lru_size_async,(u64)free_unref_page_list_async ,(u64)__count_memcg_events_async ,(u64)mem_cgroup_disabled_async ,(u64)__mod_memcg_lruvec_state_async,(u64)putback_lru_page_async,(u64)try_to_unmap_flush_async ,(u64)root_mem_cgroup_async,(u64)compound_page_dtors_async,(u64)__mem_cgroup_uncharge_list_async,(u64)cache_random_seq_destroy_async);
 		return -1;
 	}
     
@@ -1629,6 +1631,7 @@ static int look_up_not_export_function(void)
 	    printk("sb_lock_async:0x%llx super_blocks_async:0x%llx security_sb_free_async:0x%llx destroy_super_rcu_async:0x%llx\n",(u64)sb_lock_async,(u64)super_blocks_async,(u64)security_sb_free_async,(u64)destroy_super_rcu_async);
 	}
 
+	if(shrink_page_printk_open1)
 	printk("kallsyms_lookup_name:0x%llx root_mem_cgroup:0x%llx\n",(u64)(kp_kallsyms_lookup_name.addr),(u64)root_mem_cgroup_async);
 	return 0;
 }
@@ -2328,6 +2331,8 @@ static void file_stat_truncate_inode_pages(struct file_stat * p_file_stat)
 static int drop_cache_truncate_inode_pages(struct hot_cold_file_global *p_hot_cold_file_global)
 {
 	int scan_count = 0;
+	struct inode *inode;
+
     struct file_stat * p_file_stat,*p_file_stat_temp;
     list_for_each_entry_safe_reverse(p_file_stat,p_file_stat_temp,&p_hot_cold_file_global->drop_cache_file_stat_head,hot_cold_file_list){
 		//有可能该文件又hot_file_update_file_status()中被访问了，则p_file_stat->file_area_count非0
@@ -2337,8 +2342,9 @@ static int drop_cache_truncate_inode_pages(struct hot_cold_file_global *p_hot_co
 			 * 不处理*/
 			lock_file_stat(p_file_stat,0);
 			if(NULL == p_file_stat->mapping || atomic_read(&p_file_stat->mapping->host->i_count) == 0){
-			
-				//__destroy_inode_handler_post()正在删除inode，标记file_stat删除，这里先等那些进程全都退出__destroy_inode_handler_post函数
+unsed_inode:	
+				/*可能其他进程__destroy_inode_handler_post()正在删除inode，标记file_stat删除，这里先等那些进程全都退出__destroy_inode_handler_post函数。
+				 *否则，这里强行使用 p_file_stat->mapping->rh_reserved1会crash，因为mapping对应的inode可能被释放了*/
 				while(atomic_read(&hot_cold_file_global_info.inode_del_count))
 					msleep(1);//此时不会有进程并发向global drop_cache_file_stat_head链表添加删除成员，因此可以休眠
 
@@ -2367,9 +2373,28 @@ static int drop_cache_truncate_inode_pages(struct hot_cold_file_global *p_hot_co
 			 *file_stat_truncate_inode_pages()过程可能比较耗时！不行，分析见file_stat_free_leak_page函数*/
 			
 			//释放文件的pagecache
-		    file_stat_truncate_inode_pages(p_file_stat);
-			//释放文件pagecache后解锁file_stat lock。
+			inode = p_file_stat->mapping->host;
+			/*inode->i_lock后再测试一次inode是否被其他进程并发iput，是的话下边if成立.到这里不用担心inode结构被其他进程释放了，因为此时
+			 * lock_file_stat(p_file_stat)加锁保证，到这里inode不会被其他进程释放*/
+            spin_lock(&inode->i_lock);
+			if( ((inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW))) || atomic_read(&inode->i_count) == 0){
+			    spin_unlock(&inode->i_lock);
+				//unlock_file_stat(p_file_stat); unsed_inode分支已经有unlock_file_stat
+				
+				//如果inode已经释放了，则要goto unsed_inode分支释放掉file_stat结构
+		        goto unsed_inode;
+			}
+            //令inode引用计数加1,下边file_stat_truncate_inode_pages不用担心inode被其他进程释放掉
+			atomic_inc(&inode->i_count);
+			spin_unlock(&inode->i_lock);
+			//解锁file_stat lock。
 			unlock_file_stat(p_file_stat);
+
+			//释放文件的pagecache
+		    file_stat_truncate_inode_pages(p_file_stat);
+			//令inode引用计数减1
+            iput(inode);
+
 
             /*把文件file_stat移动到file_stat_zero_file_area_head链表，如果一段时间改文件还是没被访问，则释放掉file_stat.因为此时
 			 * hot_file_update_file_status()中可能并发把file_stat移动到global 热文件或者大文件链表，因此需要global_lock加锁。错了，
@@ -2553,6 +2578,22 @@ static void __put_super_async(struct super_block *s)
 		call_rcu(&s->rcu, destroy_super_rcu_async);
 	}
 }
+static inline int is_support_file_system_type(struct super_block *sb)
+{
+	const char *sb_name;
+
+	sb_name = sb->s_type->name;
+	//异步drop_cache bdev的文件inode 的pagecahce，会导致umount ext4文件系统卡死、crash的问题，要过滤掉
+	if(strcmp(sb_name,"bdev") == 0)
+		return 0;
+
+	/*ext4、xfs、fuse 是测试过异步drop_cache没事的文件系统，如果你想支持新的文件系统，在这里添加即可。其他形如
+	 cgroup、tmpfs等常规文件系统，为了异步drop_cache安全还是过滤掉*/
+    if(strcmp(sb_name,"ext4") == 0 || strcmp(sb_name,"xfs") == 0 || strcmp(sb_name,"fuse") == 0 /*||strcmp(sb_name,"f2fs") == 0*/){
+	    return 1;
+	}
+	return 0;
+}
 /*在加载该异步内存回收前，可能已经有文件产生了pagecache，这部分文件页page就无法转换成file_area了，因为不再被读写，无法执行
  * hot_file_update_file_status函数被统计到。该函数通过所有文件系统的super_block遍历每一个文件的inode，看哪个文件的pagecache很多
  * 但是没有被该异步内存回收模块的file_stat和file_area接管。那就强制释放这些文件的pagecache，因为这些文件很长时间不被访问了，
@@ -2573,7 +2614,7 @@ static void iterate_supers_async(void)
 		spin_unlock(sb_lock_async);
 
 		down_read(&sb->s_umount);
-		if (sb->s_root && (sb->s_flags & SB_BORN))
+		if (sb->s_root && (sb->s_flags & SB_BORN) && is_support_file_system_type(sb))
 			ret = drop_pagecache_sb_async(sb, NULL);
 		up_read(&sb->s_umount);
 
@@ -2590,7 +2631,8 @@ static void iterate_supers_async(void)
 	    __put_super_async(p);
 	spin_unlock(sb_lock_async);
 
-	printk("drop_cache super_blocks:%d files:%d\n",super_block_count,hot_cold_file_global_info.drop_cache_file_count);
+	if(shrink_page_printk_open1)
+	    printk("drop_cache super_blocks:%d files:%d\n",super_block_count,hot_cold_file_global_info.drop_cache_file_count);
 }
 /*************以上代码不同内核版本有差异******************************************************************************************/
 
@@ -4912,6 +4954,22 @@ static int hot_cold_file_init(void)
 	if(look_up_not_export_function())
 		return -1;
 
+#ifdef CONFIG_X86
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+#if 0
+	kfree(hot_cold_file_global_info.file_stat_cachep->random_seq);
+	hot_cold_file_global_info.file_stat_cachep->random_seq = NULL;
+	kfree(hot_cold_file_global_info.file_area_cachep->random_seq);
+	hot_cold_file_global_info.file_area_cachep->random_seq = NULL;
+	kfree(hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep->random_seq);
+	hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep->random_seq = NULL;
+#else
+	cache_random_seq_destroy_async(hot_cold_file_global_info.file_stat_cachep);
+	cache_random_seq_destroy_async(hot_cold_file_global_info.file_area_cachep);
+	cache_random_seq_destroy_async(hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep);
+#endif
+    #endif
+#endif	
 	return 0;
 }
 /*****************************************************************************************/

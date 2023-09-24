@@ -49,6 +49,8 @@
 #include <linux/version.h>
 #include <linux/mm_inline.h>
 #include <linux/proc_fs.h>
+//#include <linux/slub_def.h>
+//#include <linux/slab_def.h> 能添加，编译同时报错invalid use of undefined type ‘const struct slab’
 
 //一个file_stat结构里缓存的热file_area结构个数
 #define FILE_AREA_CACHE_COUNT 3
@@ -980,6 +982,7 @@ static spinlock_t *sb_lock_async;
 static struct list_head *super_blocks_async;
 static void (*security_sb_free_async)(struct super_block *sb);
 static void (*destroy_super_rcu_async)(struct rcu_head *head);
+static void (*cache_random_seq_destroy_async)(struct kmem_cache *cachep);
 
 /* Check if a page is dirty or under writeback */
 inline static void folio_check_dirty_writeback_async(struct folio *folio,
@@ -1524,11 +1527,12 @@ static int look_up_not_export_function(void)
 	__mem_cgroup_uncharge_list_async = (void*)kallsyms_lookup_name_async("__mem_cgroup_uncharge_list");
 	root_mem_cgroup_async = (struct mem_cgroup *)kallsyms_lookup_name_async("root_mem_cgroup");
 	compound_page_dtors_async= (compound_page_dtor *  (*)[NR_COMPOUND_DTORS])kallsyms_lookup_name_async("compound_page_dtors");
-	if(!__remove_mapping_async || !mem_cgroup_update_lru_size_async  || !free_unref_page_list_async || !__count_memcg_events_async  || !mem_cgroup_disabled_async  || !__mod_memcg_lruvec_state_async  || !putback_lru_page_async  || !try_to_unmap_flush_async  || !root_mem_cgroup_async || !compound_page_dtors_async || !__mem_cgroup_uncharge_list_async){
-		printk("!!!!!!!!!! error __remove_mapping_async:0x%llx mem_cgroup_update_lru_size_async:0x%llx free_unref_page_list_async:0x%llx __count_memcg_events_async:0x%llx mem_cgroup_disabled_async:0x%llx __mod_memcg_lruvec_state_async:0x%llx putback_lru_page_async:0x%llx try_to_unmap_flush_async:0x%llx root_mem_cgroup_async:0x%llx compound_page_dtors_async:0x%llx __mem_cgroup_uncharge_list_async:0x%llx",(u64)__remove_mapping_async,(u64)mem_cgroup_update_lru_size_async,(u64)free_unref_page_list_async ,(u64)__count_memcg_events_async ,(u64)mem_cgroup_disabled_async ,(u64)__mod_memcg_lruvec_state_async,(u64)putback_lru_page_async,(u64)try_to_unmap_flush_async ,(u64)root_mem_cgroup_async,(u64)compound_page_dtors_async,(u64)__mem_cgroup_uncharge_list_async);
+	cache_random_seq_destroy_async = (void *)kallsyms_lookup_name_async("cache_random_seq_destroy");
+
+	if(!__remove_mapping_async || !mem_cgroup_update_lru_size_async  || !free_unref_page_list_async || !__count_memcg_events_async  || !mem_cgroup_disabled_async  || !__mod_memcg_lruvec_state_async  || !putback_lru_page_async  || !try_to_unmap_flush_async  || !root_mem_cgroup_async || !compound_page_dtors_async || !__mem_cgroup_uncharge_list_async || !cache_random_seq_destroy_async){
+		printk("!!!!!!!!!! error __remove_mapping_async:0x%llx mem_cgroup_update_lru_size_async:0x%llx free_unref_page_list_async:0x%llx __count_memcg_events_async:0x%llx mem_cgroup_disabled_async:0x%llx __mod_memcg_lruvec_state_async:0x%llx putback_lru_page_async:0x%llx try_to_unmap_flush_async:0x%llx root_mem_cgroup_async:0x%llx compound_page_dtors_async:0x%llx __mem_cgroup_uncharge_list_async:0x%llx cache_random_seq_destroy_async:0x%llx",(u64)__remove_mapping_async,(u64)mem_cgroup_update_lru_size_async,(u64)free_unref_page_list_async ,(u64)__count_memcg_events_async ,(u64)mem_cgroup_disabled_async ,(u64)__mod_memcg_lruvec_state_async,(u64)putback_lru_page_async,(u64)try_to_unmap_flush_async ,(u64)root_mem_cgroup_async,(u64)compound_page_dtors_async,(u64)__mem_cgroup_uncharge_list_async,(u64)cache_random_seq_destroy_async);
 		return -1;
 	}
-    
     
 	/*mem_cgroup_disabled明明是inline类型，但是cat /proc/kallsyms却可以看到它的函数指针。并且还可以在ko里直接用mem_cgroup_disabled()函数。
 	 * 但是测试表明，cat /proc/kallsyms看到的mem_cgroup_disabled()函数指针  和 在驱动里直接打印mem_cgroup_disabled()函数指针，竟然不一样，
@@ -1547,7 +1551,8 @@ static int look_up_not_export_function(void)
 	    printk("sb_lock_async:0x%llx super_blocks_async:0x%llx security_sb_free_async:0x%llx destroy_super_rcu_async:0x%llx\n",(u64)sb_lock_async,(u64)super_blocks_async,(u64)security_sb_free_async,(u64)destroy_super_rcu_async);
 	}
 
-	printk("kallsyms_lookup_name:0x%llx root_mem_cgroup:0x%llx\n",(u64)(kp_kallsyms_lookup_name.addr),(u64)root_mem_cgroup_async);
+	if(shrink_page_printk_open1)
+	    printk("kallsyms_lookup_name:0x%llx root_mem_cgroup:0x%llx\n",(u64)(kp_kallsyms_lookup_name.addr),(u64)root_mem_cgroup_async);
 	return 0;
 }
 //遍历p_file_stat对应文件的file_area_free链表上的file_area结构，找到这些file_area结构对应的page，这些page被判定是冷页，可以回收
@@ -4696,6 +4701,32 @@ static int hot_cold_file_init(void)
 	//获取用到的内核非export的函数指针
 	if(look_up_not_export_function())
 		return -1;
+
+#ifdef CONFIG_X86
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	/*x86架构5.10内核后在触发int3 kprobe中断后，会令nmi中断计数加1。接着执行kprobe的函数hot_file_update_file_status,
+	 * 执行里边的kmem_cache_alloc分配slab时，执行到allocate_slab->shuffle_freelist->get_random_int分配一个随机数。
+	 * 最后有概率执行到__blake2s_final->blake2s_compress->kernel_fpu_begin->irq_fpu_usable函数，在irq_fpu_usable
+	 * 函数中，因为nmi中断计数大于0，导致if (WARN_ON_ONCE(in_nmi()))成立，从而触发内核warn告警。为了解决这个问题，
+	 * 令slab的random_seq置NULL，从而禁止掉分配slab在shuffle_freelist中执行get_random_int获取随机数。很不理解为什么
+	 * x86结构5.10内核要在触发int3 kprobe中断后，要令NMI中断加1，有这个必要吗？NMI中断是mce、长时间关中断才会触发的呀!!!*/
+#if 0
+	/*编译不通过，一直打印"invalid use of undefined type ‘struct kmem_cache"。*/
+	kfree(hot_cold_file_global_info.file_stat_cachep->random_seq);
+	hot_cold_file_global_info.file_stat_cachep->random_seq = NULL;
+	
+	kfree(hot_cold_file_global_info.file_area_cachep->random_seq);
+	hot_cold_file_global_info.file_area_cachep->random_seq = NULL;
+	
+	kfree(hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep->random_seq);
+	hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep->random_seq = NULL;
+#else
+	cache_random_seq_destroy_async(hot_cold_file_global_info.file_stat_cachep);
+	cache_random_seq_destroy_async(hot_cold_file_global_info.file_area_cachep);
+	cache_random_seq_destroy_async(hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep);
+#endif
+    #endif
+#endif	
 
 	return 0;
 }
