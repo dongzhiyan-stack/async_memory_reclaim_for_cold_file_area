@@ -2214,21 +2214,22 @@ static void file_stat_truncate_inode_pages(struct file_stat * p_file_stat)
 //释放drop cache的文件的pagecache
 static int drop_cache_truncate_inode_pages(struct hot_cold_file_global *p_hot_cold_file_global)
 {
+	//return 0;
 	int scan_count = 0;
 	struct inode *inode;
-
     struct file_stat * p_file_stat,*p_file_stat_temp;
     list_for_each_entry_safe_reverse(p_file_stat,p_file_stat_temp,&p_hot_cold_file_global->drop_cache_file_stat_head,hot_cold_file_list){
+		printk("%s p_file_stat:0x%llx p_file_stat->mapping:0x%llx file_stat_status:0x%lx %d\n",__func__,(u64)p_file_stat,(u64)p_file_stat->mapping,p_file_stat->file_stat_status,p_file_stat->file_area_count);	
 		//有可能该文件又hot_file_update_file_status()中被访问了，则p_file_stat->file_area_count非0
         if(0 == p_file_stat->file_area_count){
+    #if 1
 			/*file_stat加锁，防止此时inode并发被删除了。如果删除了则p_file_stat->mapping 是NULL，不再处理。此时文件file_stat也会自动被加上
 			 * delete标记，然后删除掉file_stat。并且，如果inode引用计数是0，说明inode马上也要被释放了，没人用了，这种文件file_stat也跳过
 			 * 不处理*/
 			lock_file_stat(p_file_stat,0);
 			if(NULL == p_file_stat->mapping || atomic_read(&p_file_stat->mapping->host->i_count) == 0){
-unsed_inode:	
-				/*可能其他进程__destroy_inode_handler_post()正在删除inode，标记file_stat删除，这里先等那些进程全都退出__destroy_inode_handler_post函数。
-				 *否则，这里强行使用 p_file_stat->mapping->rh_reserved1会crash，因为mapping对应的inode可能被释放了*/
+			
+				//__destroy_inode_handler_post()正在删除inode，标记file_stat删除，这里先等那些进程全都退出__destroy_inode_handler_post函数
 				while(atomic_read(&hot_cold_file_global_info.inode_del_count))
 					msleep(1);//此时不会有进程并发向global drop_cache_file_stat_head链表添加删除成员，因此可以休眠
 
@@ -2249,42 +2250,46 @@ unsed_inode:
 				 * 只有异步内存回收线程会操作file_stat_delete_head链表*/
 				list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->file_stat_delete_head);
 
-				unlock_file_stat(p_file_stat);
+				//unlock_file_stat(p_file_stat);
 			
 				continue;
 			}
 			/*到这里，是否可以通过对inode引用计数加1防止inode被删除呢？这样就避免长时间使用lock_file_stat锁，因为
 			 *file_stat_truncate_inode_pages()过程可能比较耗时！不行，分析见file_stat_free_leak_page函数*/
-			
+    #if 1	
 			//释放文件的pagecache
 			inode = p_file_stat->mapping->host;
-			/*inode->i_lock后再测试一次inode是否被其他进程并发iput，是的话下边if成立.到这里不用担心inode结构被其他进程释放了，因为此时
-			 * lock_file_stat(p_file_stat)加锁保证，到这里inode不会被其他进程释放*/
             spin_lock(&inode->i_lock);
 			if( ((inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW))) || atomic_read(&inode->i_count) == 0){
 			    spin_unlock(&inode->i_lock);
-				//unlock_file_stat(p_file_stat); unsed_inode分支已经有unlock_file_stat
-				
-				//如果inode已经释放了，则要goto unsed_inode分支释放掉file_stat结构
-		        goto unsed_inode;
+				unlock_file_stat(p_file_stat);
+		        continue;	
 			}
-            //令inode引用计数加1,下边file_stat_truncate_inode_pages不用担心inode被其他进程释放掉
+
 			atomic_inc(&inode->i_count);
 			spin_unlock(&inode->i_lock);
-			//解锁file_stat lock。
+			//释放文件pagecache后解锁file_stat lock。
 			unlock_file_stat(p_file_stat);
 
-			//释放文件的pagecache
 		    file_stat_truncate_inode_pages(p_file_stat);
-			//令inode引用计数减1
             iput(inode);
+    #else			
+			inode = p_file_stat->mapping->host;
+			if((inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW))){
+				continue;
+			}
+		    file_stat_truncate_inode_pages(p_file_stat);
+            iput(inode);
+			//释放文件pagecache后解锁file_stat lock。
+			unlock_file_stat(p_file_stat);
+    #endif			
 
-
+#endif
             /*把文件file_stat移动到file_stat_zero_file_area_head链表，如果一段时间改文件还是没被访问，则释放掉file_stat.因为此时
 			 * hot_file_update_file_status()中可能并发把file_stat移动到global 热文件或者大文件链表，因此需要global_lock加锁。错了，
 			 * 不用加锁，因为这些file_stat目前还没有状态，不是in temp list状态。而hot_file_update_file_status()中只有file_stat处于
 			 * in temp list状态，才会移动到global 热文件和大文件链表*/
-
+#if 1
 			//spin_lock(&p_hot_cold_file_global->global_lock);
 			clear_file_stat_in_drop_cache(p_file_stat);
 			set_file_stat_in_zero_file_area_list(p_file_stat);
@@ -2293,9 +2298,11 @@ unsed_inode:
 			 * 强制回收一次pagecache，有点浪费性能。是否就在这里把或则file_stat释放掉得了???????????????????????????*/
             list_move_tail(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->file_stat_zero_file_area_head);
 			//spin_unlock(&p_hot_cold_file_global->global_lock);
+#endif			
 		}
 		else
 		{
+#if 1			
 		/*到这个分支，说明drop_caches的文件被访问了，分配file_area，那就不管它了。让这个文件file_stat按照正常的异步内存回收参与回收page，
 		 *等到file_area对应的page被释放完后。文件file_stat一个file_area都没有，然后被移动到p_hot_cold_file_global->file_stat_zero_file_area_head
 		  链表。而如果p_hot_cold_file_global->file_stat_zero_file_area_head，链表上的file_stat还有很多pagecache，说明这些pagecache
@@ -2307,6 +2314,7 @@ unsed_inode:
             set_file_stat_in_file_stat_temp_head_list(p_file_stat);
 			list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->file_stat_temp_head);
 			spin_unlock(&p_hot_cold_file_global->global_lock);
+#endif			
 		}
 		//drop_cache文件数减1
 	    hot_cold_file_global_info.drop_cache_file_count --;
@@ -2460,23 +2468,8 @@ static void __put_super_async(struct super_block *s)
 		put_user_ns(s->s_user_ns);
 		kfree(s->s_subtype);
 		call_rcu(&s->rcu, destroy_super_rcu_async);
+		printk("%s\n",__func__);
 	}
-}
-static inline int is_support_file_system_type(struct super_block *sb)
-{
-	const char *sb_name;
-
-	sb_name = sb->s_type->name;
-	//异步drop_cache bdev的文件inode 的pagecahce，会导致umount ext4文件系统卡死、crash的问题，要过滤掉
-	if(strcmp(sb_name,"bdev") == 0)
-		return 0;
-
-	/*ext4、xfs、fuse 是测试过异步drop_cache没事的文件系统，如果你想支持新的文件系统，在这里添加即可。其他形如
-	 cgroup、tmpfs等常规文件系统，为了异步drop_cache安全还是过滤掉*/
-    if(strcmp(sb_name,"ext4") == 0 || strcmp(sb_name,"xfs") == 0 || strcmp(sb_name,"fuse") == 0 /*||strcmp(sb_name,"f2fs") == 0*/){
-	    return 1;
-	}
-	return 0;
 }
 /*在加载该异步内存回收前，可能已经有文件产生了pagecache，这部分文件页page就无法转换成file_area了，因为不再被读写，无法执行
  * hot_file_update_file_status函数被统计到。该函数通过所有文件系统的super_block遍历每一个文件的inode，看哪个文件的pagecache很多
@@ -2488,6 +2481,7 @@ static void iterate_supers_async(void)
 	struct super_block *sb, *p = NULL;
     int ret = 0;
 	unsigned int super_block_count = 0;
+    const char *sb_name;
 
 	spin_lock(sb_lock_async);
 	list_for_each_entry(sb, super_blocks_async, s_list) {
@@ -2497,9 +2491,12 @@ static void iterate_supers_async(void)
 		sb->s_count++;
 		spin_unlock(sb_lock_async);
 
+		sb_name = sb->s_type->name;
 		down_read(&sb->s_umount);
-		if (sb->s_root && (sb->s_flags & SB_BORN) && is_support_file_system_type(sb))
+		if (sb->s_root && (sb->s_flags & SB_BORN) && (strcmp(sb_name,"bdev") == 0 /*&& strcmp(sb_name,"xfs") == 0*/)){
+		    printk("%s\n",sb_name);
 			ret = drop_pagecache_sb_async(sb, NULL);
+	    }
 		up_read(&sb->s_umount);
 
 		spin_lock(sb_lock_async);
@@ -2515,8 +2512,7 @@ static void iterate_supers_async(void)
 	    __put_super_async(p);
 	spin_unlock(sb_lock_async);
 
-	if(shrink_page_printk_open1)
-	    printk("drop_cache super_blocks:%d files:%d\n",super_block_count,hot_cold_file_global_info.drop_cache_file_count);
+	printk("drop_cache super_blocks:%d files:%d\n",super_block_count,hot_cold_file_global_info.drop_cache_file_count);
 }
 /*************以上代码不同内核版本有差异******************************************************************************************/
 
