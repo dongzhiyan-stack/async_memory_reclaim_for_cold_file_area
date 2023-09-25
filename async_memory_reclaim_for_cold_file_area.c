@@ -530,7 +530,7 @@ static int hot_cold_file_init(void);
 static int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_file_global,struct seq_file *m,int is_proc_print);
 static void printk_shrink_param(struct hot_cold_file_global *p_hot_cold_file_global,struct seq_file *m,int is_proc_print);
 static void iterate_supers_async(void);
-static void inline cold_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del);
+static int inline cold_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del);
 
 static inline void lock_file_stat(struct file_stat * p_file_stat,int not_block){
 	//如果有其他进程对file_stat的lock加锁，while成立，则休眠等待这个进程释放掉lock，然后自己加锁
@@ -2304,7 +2304,8 @@ unsed_inode:
 				    p_file_stat->mapping->rh_reserved1 = 0;
 					barrier();
 				    p_file_stat->mapping = NULL;
-					smp_wmb();//在这个加个内存屏障，保证前后代码隔离开。即file_stat有delete标记后，inode->i_mapping->rh_reserved1一定是0，p_file_stat->mapping一定是NULL
+					/*这个加个内存屏障，保证前后代码隔离开。即file_stat有delete标记后，inode->i_mapping->rh_reserved1一定是0，p_file_stat->mapping一定是NULL*/
+					smp_wmb();
 				}
 				//file_stat可能在__destroy_inode_handler_post删除inode时已经标记了file_stat delete，这里不再重复操作，否则会crash
 				if(0 == file_stat_in_delete(p_file_stat))
@@ -2978,23 +2979,42 @@ static unsigned int cold_file_area_detele_quick(struct hot_cold_file_global *p_h
 	return 0;
 }
 //异步内存回收线程把file_stat从p_hot_cold_file_global的链表中剔除，释放file_stat结构，释放前需要先lock_file_stat()防止其他进程并发访问file_stat
-static void inline cold_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del)
+static int inline cold_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del)
 {
-	/*lock_file_stat加锁原因是:当异步内存回收线程在这里释放file_stat结构时，同一时间file_stat对应文件inode正在被释放而执行到
+	/*1:lock_file_stat加锁原因是:当异步内存回收线程在这里释放file_stat结构时，同一时间file_stat对应文件inode正在被释放而执行到
 	 * __destroy_inode_handler_post()函数。如果这里把file_stat释放了，__destroy_inode_handler_post()使用file_stat就要crash。
 	 * 而lock_file_stat()防止这种情况。同时，__destroy_inode_handler_post()执行后会立即释放inode和mapping，然后此时这里要用到
 	 * p_file_stat->mapping->rh_reserved1，此时同样也会因file_stat已经释放而crash
-	 * */
+	 *2:spin_lock(&p_file_stat_del->file_stat_lock)加锁的作用是，此时该文件可能在hot_file_update_file_status()函数被并发访问，分配
+	 * 新的file_area，这样该file_stat就不能释放了*/
+
 	lock_file_stat(p_file_stat_del,0);
+
+	spin_lock(&p_file_stat_del->file_stat_lock);
+	/*如果file_stat的file_area个数大于0，说明此时该文件被方法访问了，在hot_file_update_file_status()中分配新的file_area。
+	 *此时这个file_stat就不能释放了*/
+	if(p_file_stat_del->file_area_count > 0){
+		/*此时file_stat是不可能有delete标记的，有的话告警。防止__destroy_inode_handler_post中设置了delete。正常不可能，这里有lock_file_stat加锁防护*/
+		if(file_stat_in_delete(p_file_stat_del)){
+			printk("%s %s %d file_stat:0x%llx status:0x%lx in delete\n",__func__,current->comm,current->pid,(u64)p_file_stat_del,p_file_stat_del->file_stat_status);
+			dump_stack();
+		}	
+		spin_unlock(&p_file_stat_del->file_stat_lock);
+		unlock_file_stat(p_file_stat_del);
+	    return 1;
+	}
 	/*如果file_stat在__destroy_inode_handler_post中被释放了，file_stat一定有delete标记。否则没有delete标记，这里先标记file_stat的delete*/
 	if(0 == file_stat_in_delete(p_file_stat_del)/*p_file_stat_del->mapping*/){
-		//文件inode的mapping->rh_reserved1清0表示file_stat无效，这__destroy_inode_handler_post()删除inode时，发现inode的mapping->rh_reserved1是0就不再使用file_stat了，会crash
+		/*文件inode的mapping->rh_reserved1清0表示file_stat无效，这__destroy_inode_handler_post()删除inode时，发现inode的mapping->rh_reserved1是0就不再使用file_stat了，会crash*/
 		p_file_stat_del->mapping->rh_reserved1 = 0;
 		barrier();
 		p_file_stat_del->mapping = NULL;
-		smp_wmb();//在这个加个内存屏障，保证前后代码隔离开。即file_stat有delete标记后，inode->i_mapping->rh_reserved1一定是0，p_file_stat->mapping一定是NULL
+		/*在这个加个内存屏障，保证前后代码隔离开。即file_stat有delete标记后，inode->i_mapping->rh_reserved1一定是0，p_file_stat->mapping一定是NULL*/
+		smp_wmb();
 		set_file_stat_in_delete(p_file_stat_del);
 	}
+	spin_unlock(&p_file_stat_del->file_stat_lock);
+
 	unlock_file_stat(p_file_stat_del);
 
 	//如果有进程正在"hot_file_update_file_status()访问file_stat"，会用到file_stat，则这里先休眠等待它用完file_stat再释放file_stat，二者可能用的是同一个file_stat
@@ -3024,6 +3044,8 @@ static void inline cold_file_stat_delete(struct hot_cold_file_global *p_hot_cold
 
 	if(shrink_page_printk_open1)
 	    printk("%s file_stat:0x%llx delete !!!!!!!!!!!!!!!!\n",__func__,(u64)p_file_stat_del);
+
+	return 0;
 }
 //删除p_file_stat_del对应文件的file_stat上所有的file_area，已经对应hot file tree的所有节点hot_cold_file_area_tree_node结构。最后释放掉p_file_stat_del这个file_stat数据结构
 static unsigned int cold_file_stat_delete_all_file_area(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del)
@@ -3177,12 +3199,12 @@ static int hot_file_update_file_status(struct page *page)
 		 *2:还有一个作用，上边的ref_count原子变量加1可能不能禁止编译器重排序，因此这个内存屏障可以防止reorder*/
 		smp_rmb();
 
+retry:   
 		/*还要再判断一次async_memory_reclaim_status是否是0，因为驱动卸载会先获取原子变量ref_count的值0，然后这里再执行
 		 *atomic_inc(&hot_cold_file_global_info.ref_count)令ref_count加1.这种情况必须判断async_memory_reclaim_status是0，
 		 *直接return返回。否则驱动卸载过程会释放掉file_stat结构，然后该函数再使用这个file_stat结构，触发crash*/
 		if(!test_bit(ASYNC_MEMORY_RECLAIM_ENABLE,&async_memory_reclaim_status))
 			goto out;
-        
 		//smp_rmb();这个内存屏障移动到前边
 		//如果两个进程同时访问同一个文件的page0和page1，这就就有问题了，因为这个if会同时成立。然后下边针对
 		if(mapping->rh_reserved1 == 0 ){
@@ -3244,10 +3266,14 @@ already_alloc:
 			printk("%s p_file_stat:0x%llx error or p_file_stat->mapping != mapping\n",__func__,(u64)p_file_stat);
 			goto out;
 		}
+		/*分析证实，此时file_stat是可能在file_stat_has_zero_file_area_manage->cold_file_stat_delete()中被并发标记delete的。防护措施
+		 *是下边spin_lock(&p_file_stat->file_stat_lock)加锁后，再判断file_stat是否有delete标记有的话，就goto retry分配新的file_stat*/
+	#if 0
 		//如果当前正在使用的file_stat的inode已经释放了，主动触发crash 
 		if(file_stat_in_delete(p_file_stat)){
 			panic("%s %s %d file_stat:0x%llx status:0x%lx in delete\n",__func__,current->comm,current->pid,(u64)p_file_stat,p_file_stat->file_stat_status);
 		}
+   #endif	
 
 		//每个周期执行hot_file_update_file_status函数访问所有文件的所有file_area总次数
         hot_cold_file_global_info.hot_cold_file_shrink_counter.all_file_area_access_count ++;
@@ -3287,8 +3313,8 @@ already_alloc:
 				else
 				{
 				    p_file_stat->hot_file_area_cache[i] = NULL;
-					//加这个内存屏障，是保证其他进程看到file_area被清理了in cache状态状态后，p_file_stat->hot_file_area_cache[i] = NULL
-					//这个赋值所有cpu也都同步给其他cpu了
+					/*加这个内存屏障，是保证其他进程看到file_area被清理了in cache状态状态后，p_file_stat->hot_file_area_cache[i] = NULL
+					  这个赋值所有cpu也都同步给其他cpu了*/
 					smp_wmb();
 					clear_file_area_in_cache(p_file_area);
 					smp_wmb();
@@ -3346,6 +3372,15 @@ already_alloc:
 		}
 
 		spin_lock(&p_file_stat->file_stat_lock);
+		/*分析证实，此时file_stat是可能在file_stat_has_zero_file_area_manage->cold_file_stat_delete()中被并发标记delete的。
+		 *于是这里spin_lock(&p_file_stat->file_stat_lock)加锁后，判断出file_stat有delete标记，说明file_stat已经要释放，无效了，于是
+		 *就goto retry分配新的file_stat*/
+		if(file_stat_in_delete(p_file_stat)){
+			if(p_file_stat->mapping->rh_reserved1 != 0)
+			    panic("%s %s %d file_stat:0x%llx status:0x%lx rh_reserved1!= 0\n",__func__,current->comm,current->pid,(u64)p_file_stat,p_file_stat->file_stat_status);
+			
+		    goto retry;
+		}
 		//p_file_area不为NULL说明在上边已经找到file_area了,就不用再执行if里边代码了
 		if(p_file_area == NULL){
 			/*根据page索引的file_area的索引，找到对应在file area tree树的槽位，page_slot_in_tree双重指针指向这个槽位。
@@ -4414,7 +4449,10 @@ static void file_stat_has_zero_file_area_manage(struct hot_cold_file_global *p_h
 			  决定在里边lock_file_stat()加锁，防护inode被删除*/
 			file_stat_free_leak_page(p_hot_cold_file_global,p_file_stat);
 
-			cold_file_stat_delete(p_hot_cold_file_global,p_file_stat);
+			//如果返回值大于0说明file_stat对应文件被并发访问了，于是goto file_stat_access分支处理
+			if(cold_file_stat_delete(p_hot_cold_file_global,p_file_stat) > 0)
+				goto file_stat_access;
+
 			del_file_stat_count ++;
 			//0个file_area的file_stat个数减1
 			p_hot_cold_file_global->file_stat_count_zero_file_area --;
@@ -4423,6 +4461,7 @@ static void file_stat_has_zero_file_area_manage(struct hot_cold_file_global *p_h
 		 *file_stat_hot_head链表*/
 		else if (p_file_stat->file_area_count > 0)
 		{
+file_stat_access:		
 			//0个file_area的file_stat个数减1
 			p_hot_cold_file_global->file_stat_count_zero_file_area --;
 
@@ -4731,10 +4770,8 @@ static int hot_cold_file_thread(void *p){
 				return 0;
 			msleep(1000);
 		}
-        if(0 == test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status))
-			return 0;
-
-		walk_throuth_all_file_area(p_hot_cold_file_global);
+        if(test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status))	
+		    walk_throuth_all_file_area(p_hot_cold_file_global);
 	}
 	return 0;
 }
@@ -4898,7 +4935,8 @@ static void __destroy_inode_handler_post(struct kprobe *p, struct pt_regs *regs,
 				inode->i_mapping->rh_reserved1 = 0;
 				barrier();
 				p_file_stat->mapping = NULL;
-				smp_wmb();//在这个加个内存屏障，保证前后代码隔离开。即file_stat有delete标记后，inode->i_mapping->rh_reserved1一定是0，p_file_stat->mapping一定是NULL
+				/*在这个加个内存屏障，保证前后代码隔离开。即file_stat有delete标记后，inode->i_mapping->rh_reserved1一定是0，p_file_stat->mapping一定是NULL*/
+				smp_wmb();
 
 				/*这里有个很大的隐患，此时file_stat可能处于global file_stat_hot_head、file_stat_temp_head、file_stat_temp_large_file_head 
 				 *3个链表，这里突然设置set_file_stat_in_delete，将来这些global 链表遍历这个file_stat，发现没有 file_stat_in_file_stat_hot_head
@@ -5023,8 +5061,6 @@ static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
 	kthread_stop(hot_cold_file_global_info.hot_cold_file_thead);
 
 	//为使用 clear_bit_unlock()把async_memory_reclaim_status清0，这样使用async_memory_reclaim_status的地方不用再smp_rmb获取最的async_memory_reclaim_status值0
-	//async_memory_reclaim_status = 0;
-	//smp_wmb();
 	clear_bit_unlock(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status);//驱动卸载，把async_memory_reclaim_status清0
 
 	//如果还有进程在访问file_stat和file_area，p_hot_cold_file_global->ref_count大于0，则先休眠
