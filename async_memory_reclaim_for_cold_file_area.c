@@ -1590,18 +1590,26 @@ static unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_
 		if(traverse_file_area_count++ >= 16){
 			    traverse_file_area_count = 0;
 			#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)	
-				//使用pgdat->lru_lock锁，且有进程阻塞在这把锁上
-				if(pgdat && spin_is_contended(&pgdat->lru_lock)){
+				//使用pgdat->lru_lock锁，且有进程阻塞在这把锁上则强制休眠。还有，如果lru_lock持锁时间过长，也需要调度，否则会发生softlockups
+				if(pgdat && (spin_is_contended(&pgdat->lru_lock) || need_resched())){
 					spin_unlock(&pgdat->lru_lock); 
-					msleep(5);
+					if(need_resched())
+						schedule();
+					else
+					    msleep(5);//其实这里改成schedule()也可以!!!!!!!!!!!!!
+
 					spin_lock(&pgdat->lru_lock);
 					p_hot_cold_file_global->hot_cold_file_shrink_counter.lru_lock_contended_count ++;
 				}
             #else
 				//使用 lruvec->lru_lock 锁，且有进程阻塞在这把锁上
-				if(lruvec && spin_is_contended(&lruvec->lru_lock)){
+				if(lruvec && (spin_is_contended(&lruvec->lru_lock) || need_resched())){
 					spin_unlock(&lruvec->lru_lock); 
-					msleep(5);
+					if(need_resched())
+						schedule();
+					else
+					    msleep(5);
+
 					spin_lock(&lruvec->lru_lock);
 					p_hot_cold_file_global->hot_cold_file_shrink_counter.lru_lock_contended_count ++;
 				}
@@ -2123,6 +2131,50 @@ static const struct proc_ops async_drop_caches_fops = {
 	.proc_write		= async_drop_caches_write,
 };
 #endif
+//disable_async_memory_reclaim
+static int disable_async_memory_reclaim_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "ASYNC_MEMORY_RECLAIM_ENABLE:%d\n",test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status));
+	return 0;
+}
+static int disable_async_memory_reclaim_open(struct inode *inode, struct file *file)
+{
+	return single_open(file,disable_async_memory_reclaim_show, NULL);
+}
+static ssize_t disable_async_memory_reclaim_write(struct file *file,
+				const char __user *buffer, size_t count, loff_t *ppos)
+{   
+	int rc;
+	unsigned int val;
+	rc = kstrtouint_from_user(buffer, count, 10,&val);
+	if (rc)
+	    return rc;
+
+    if(val == 1)
+	    clear_bit_unlock(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status);
+	else
+		return -EINVAL;
+
+	return count;
+}
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
+static const struct file_operations disable_async_memory_reclaim_fops = {
+    .open		= disable_async_memory_reclaim_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= disable_async_memory_reclaim_write,
+};
+#else
+static const struct proc_ops disable_async_memory_reclaim_fops = {
+    .proc_open		= disable_async_memory_reclaim_open,
+	.proc_read		= seq_read,
+	.proc_lseek	    = seq_lseek,
+	.proc_release	= single_release,
+	.proc_write		= disable_async_memory_reclaim_write,
+};
+#endif
+
 static int async_memory_reclaime_info_show(struct seq_file *m, void *v)
 {
     hot_cold_file_print_all_file_stat(&hot_cold_file_global_info,m,1);
@@ -2186,6 +2238,11 @@ static int hot_cold_file_proc_init(struct hot_cold_file_global *p_hot_cold_file_
 		return -1;
 	}
 
+	p = proc_create("disable_async_memory_reclaim", S_IRUGO | S_IWUSR, hot_cold_file_proc_root,&disable_async_memory_reclaim_fops);
+	if (!p){
+		printk("proc_create disable_async_memory_reclaim fail\n");
+		return -1;
+	}
 	return 0;
 }
 int hot_cold_file_proc_exit(struct hot_cold_file_global *p_hot_cold_file_global)
@@ -2201,6 +2258,7 @@ int hot_cold_file_proc_exit(struct hot_cold_file_global *p_hot_cold_file_global)
 
 	remove_proc_entry("async_memory_reclaime_info",p_hot_cold_file_global->hot_cold_file_proc_root);
 	remove_proc_entry("async_drop_caches",p_hot_cold_file_global->hot_cold_file_proc_root);
+	remove_proc_entry("disable_async_memory_reclaim",p_hot_cold_file_global->hot_cold_file_proc_root);
 
 	remove_proc_entry("async_memory_reclaime",NULL);
 	return 0;
@@ -2268,8 +2326,8 @@ unsed_inode:
 			
 			//释放文件的pagecache
 			inode = p_file_stat->mapping->host;
-			/*inode->i_lock后再测试一次inode是否被其他进程并发iput，是的话下边if成立.到这里不用担心inode结构被其他进程释放了，因为此时
-			 * lock_file_stat(p_file_stat)加锁保证，到这里inode不会被其他进程释放*/
+	       /*inode->i_lock加锁后再测试一次inode是否被其他进程并发iput，是的话下边if成立.到这里不用担心inode结构被其他进程释放了，因为此时
+	        *lock_file_stat(p_file_stat)加锁保证，到这里inode结构不会被其他进程释放*/
             spin_lock(&inode->i_lock);
 			if( ((inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW))) || atomic_read(&inode->i_count) == 0){
 			    spin_unlock(&inode->i_lock);
@@ -2332,6 +2390,7 @@ unsed_inode:
  * 被文件file_stat的file_area统计到。这个函数则强制释放掉这些文件的pagecache。*/
 static void file_stat_free_leak_page(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat *p_file_stat)
 {
+	struct inode *inode;
 	//file_stat加锁，防止此时inode并发被删除了。如果删除了则p_file_stat->mapping 是NULL，直接return
 	//并且，如果inode引用计数是0，说明inode马上也要被释放了，没人用了，这种文件file_stat也跳过不处理
 	lock_file_stat(p_file_stat,0);
@@ -2339,6 +2398,21 @@ static void file_stat_free_leak_page(struct hot_cold_file_global *p_hot_cold_fil
         unlock_file_stat(p_file_stat);
 		return;
 	}
+	
+	inode = p_file_stat->mapping->host;
+	/*inode->i_lock加锁后再测试一次inode是否被其他进程并发iput，是的话下边if成立.到这里不用担心inode结构被其他进程释放了，因为此时
+	 * lock_file_stat(p_file_stat)加锁保证，到这里inode结构不会被其他进程释放*/
+	spin_lock(&inode->i_lock);
+	if( ((inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW))) || atomic_read(&inode->i_count) == 0){
+		spin_unlock(&inode->i_lock);
+		unlock_file_stat(p_file_stat);
+		return;	
+	}
+	//令inode引用计数加1,下边file_stat_truncate_inode_pages不用担心inode被其他进程释放掉
+	atomic_inc(&inode->i_count);
+	spin_unlock(&inode->i_lock);
+	unlock_file_stat(p_file_stat);
+
     /*到这里，说明文件inode没有被释放，我觉得可以模仿drop_pagecache_sb()，先spin_lock(&inode->i_lock)对inode加锁，然后执行
 	 * __iget(inode)令inode引用计数加1.然后执行invalidate_mapping_pages()放心截断释放文件的pagecache。最后用完inode再令inode
 	 * 引用计数减1，然后inode才可以被释放掉。不行，有个并发问题，到这里时，文件inode可能正好引用计数减1变为0，然后去释放文件inode。
@@ -2351,7 +2425,9 @@ static void file_stat_free_leak_page(struct hot_cold_file_global *p_hot_cold_fil
     if(p_file_stat->mapping->nrpages > p_file_stat->file_area_count << PAGE_COUNT_IN_AREA_SHIFT){
 	    file_stat_truncate_inode_pages(p_file_stat);
 	}
-	unlock_file_stat(p_file_stat);
+
+	//截断文件page后再令inode引用计数减1
+	iput(inode);
 }
 static inline int  add_file_to_file_stat(struct address_space *mapping)
 {
@@ -4413,6 +4489,8 @@ static int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_fi
 	scan_cold_file_area_count += get_file_area_from_file_stat_list(p_hot_cold_file_global,scan_file_area_max,scan_file_stat_max, 
 			&p_hot_cold_file_global->file_stat_temp_head,&file_stat_free_list_from_head_temp);
 
+    if(0 == test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status))
+		return 0;
 	/*该函数主要有5个作用
 	 * 1：释放file_stat_free_list_from_head_temp_large链表上的file_stat的file_area_free_temp链表上冷file_area的page。释放这些page后，把这些
 	 *   file_area移动到file_stat->file_area_free链表头
@@ -4428,6 +4506,9 @@ static int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_fi
 	 */
 	nr_reclaimed =  free_page_from_file_area(p_hot_cold_file_global,&file_stat_free_list_from_head_temp_large,&p_hot_cold_file_global->file_stat_temp_large_file_head); 
 	nr_reclaimed += free_page_from_file_area(p_hot_cold_file_global,&file_stat_free_list_from_head_temp,&p_hot_cold_file_global->file_stat_temp_head); 
+
+    if(0 == test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status))
+		return 0;
 
 	/*遍历hot_cold_file_global->file_stat_hot_head链表上的热文件file_stat，如果哪些file_stat不再是热文件，再要把file_stat移动回
 	 *global->file_stat_temp_head或file_stat_temp_large_file_head链表*/
@@ -4483,6 +4564,9 @@ static int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_fi
 		}
 	}
 
+    if(0 == test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status))
+		return 0;
+
 	/*遍历global file_stat_delete_head链表上已经被删除的文件的file_stat，
 	  一次不能删除太多的file_stat对应的file_area，会长时间占有cpu，后期需要调优一下*/
 	list_for_each_entry_safe_reverse(p_file_stat,p_file_stat_temp,&p_hot_cold_file_global->file_stat_delete_head,hot_cold_file_list){
@@ -4499,6 +4583,9 @@ static int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_fi
 	//释放的file_stat个数
 	p_hot_cold_file_global->hot_cold_file_shrink_counter.del_file_stat_count = del_file_stat_count;
 
+    if(0 == test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status))
+		return 0;
+
 	//对没有file_area的file_stat的处理
 	file_stat_has_zero_file_area_manage(p_hot_cold_file_global);
 
@@ -4506,6 +4593,9 @@ static int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_fi
 	if(!test_bit(ASYNC_DROP_CACHES, &async_memory_reclaim_status))
 	    //处理drop cache的文件的pagecache
 	    drop_cache_truncate_inode_pages(p_hot_cold_file_global);
+
+    if(0 == test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status))
+		return 0;
 
 	//打印所有file_stat的file_area个数和page个数
 	if(shrink_page_printk_open1)
@@ -4641,6 +4731,8 @@ static int hot_cold_file_thread(void *p){
 				return 0;
 			msleep(1000);
 		}
+        if(0 == test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status))
+			return 0;
 
 		walk_throuth_all_file_area(p_hot_cold_file_global);
 	}
