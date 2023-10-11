@@ -490,20 +490,20 @@ FILE_STATUS_ATOMIC(delete)
 /*static struct kprobe kp_mark_page_accessed = {
 	.symbol_name    = "mark_page_accessed",
 };*/
-static struct kprobe kp_read_cache_func = {
+static struct kprobe kp_write_cache_func = {
 	.symbol_name    = "iov_iter_copy_from_user_atomic",//buffer io write把数据写入文件页page执行到
 };
-static struct kprobe kp_write_cache_func = {
+static struct kprobe kp_read_cache_func = {
 	.symbol_name    = "copy_page_to_iter",//buffer io read读取文件页page数据执行到
 };
 #else
 /*static struct kprobe kp_mark_page_accessed = {
 	.symbol_name    = "folio_mark_accessed",
 };*/
-static struct kprobe kp_read_cache_func = {
+static struct kprobe kp_write_cache_func = {
 	.symbol_name    = "copy_page_from_iter_atomic",//buffer io write把数据写入文件页page执行到
 };
-static struct kprobe kp_write_cache_func = {
+static struct kprobe kp_read_cache_func = {
 	.symbol_name    = "copy_page_to_iter",//buffer io read读取文件页page数据执行到 copy_folio_to_iter()
 };
 #endif
@@ -524,7 +524,7 @@ struct hot_cold_file_global hot_cold_file_global_info;
 static int shrink_page_printk_open1 = 0;
 //不怎么关键的调试信息
 static int shrink_page_printk_open = 0;
-static unsigned long async_memory_reclaim_status = 1;
+static unsigned long async_memory_reclaim_status = 0;
 
 static int hot_cold_file_init(void);
 static int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_cold_file_global,struct seq_file *m,int is_proc_print);
@@ -5036,6 +5036,10 @@ static int __init async_memory_reclaime_for_cold_file_area_init(void)
 	if(ret < 0){
 		goto err;
 	}
+	/*驱动初始化成功再使能该功能，否则可能前边各种global、file_stat链表都还没初始化，但是先有kprpbe初始化成功，就会执行到hot_file_update_file_status
+	 *函数，但此时是因为global、file_stat链表都还没初始化，就可能会crash，这是个隐藏很深的bug!!!!!!!!!*/
+	set_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status);
+	smp_mb();
 	return 0;
 err:
 	/*if(kp_mark_page_accessed.post_handler)
