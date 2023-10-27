@@ -4018,7 +4018,7 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_cold_file_globa
 	unsigned int real_scan_file_stat_count  = 0;
 	unsigned int scan_delete_file_stat_count = 0;
 	unsigned int scan_cold_file_area_count = 0;
-	unsigned int scan_large_to_small_count = 0;
+	//unsigned int scan_large_to_small_count = 0;
 	unsigned int scan_fail_file_stat_count = 0;
 
 	unsigned int cold_file_area_for_file_stat = 0;
@@ -4075,9 +4075,13 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_cold_file_globa
 		/*file_stat_temp_head来自 hot_cold_file_global->file_stat_temp_head 或 hot_cold_file_global->file_stat_temp_large_file_head 链表，当是
 		 * hot_cold_file_global->file_stat_temp_large_file_head时，file_stat_in_large_file(p_file_stat)才会成立*/
 
+
+#if 0 
 		/*当file_stat上有些file_area长时间没有被访问则会释放掉file_are结构。此时原本在hot_cold_file_global->file_stat_temp_large_file_head 链表的
 		 *大文件file_stat则会因file_area数量减少而需要降级移动到hot_cold_file_global->file_stat_temp_head链表.这个判断起始可以放到
-		 hot_file_update_file_status()函数，算了降低损耗*/
+		 hot_file_update_file_status()函数，算了降低损耗。但是这段代码是冗余，于是把这段把有大文件标记但不再是大文件的file_stat移动到
+		 global file_stat_temp_head链表的代码放到内存回收后期执行的free_page_from_file_area()函数里了。这两处的代码本身就是重复操作，
+		 hot_file_update_file_status函数也会判断有大文件标记的file_stat是否是大文件*/
 		if(file_stat_in_large_file(p_file_stat) && !is_file_stat_large_file(&hot_cold_file_global_info,p_file_stat)){
 
 			scan_large_to_small_count ++;
@@ -4089,6 +4093,7 @@ static unsigned int get_file_area_from_file_stat_list(struct hot_cold_file_globa
 			p_hot_cold_file_global->file_stat_large_count --;
 			continue;
 		}
+#endif	
 		if(p_file_stat->recent_access_age < p_hot_cold_file_global->global_age)
 			p_file_stat->recent_access_age = p_hot_cold_file_global->global_age;
 
@@ -4279,7 +4284,7 @@ repeat:
 	//扫描的冷file_stat个数
 	p_hot_cold_file_global->hot_cold_file_shrink_counter.scan_cold_file_area_count = scan_cold_file_area_count;
 	//扫描到的大文件转小文件的个数
-	p_hot_cold_file_global->hot_cold_file_shrink_counter.scan_large_to_small_count = scan_large_to_small_count;
+	//p_hot_cold_file_global->hot_cold_file_shrink_counter.scan_large_to_small_count = scan_large_to_small_count;
 	//本次扫描到但没有冷file_area的file_stat个数
 	p_hot_cold_file_global->hot_cold_file_shrink_counter.scan_fail_file_stat_count = scan_fail_file_stat_count;
 
@@ -4310,6 +4315,7 @@ static unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot
 	unsigned int file_area_refault_to_temp_list_count = 0;
 	unsigned int file_area_free_count = 0;
 	unsigned int file_area_hot_to_temp_list_count = 0;
+	unsigned int scan_large_to_small_count = 0;
 
 	/*同一个文件file_stat的file_area对应的page，更大可能是属于同一个内存节点node，所以要基于一个个文件的file_stat来扫描file_area，
 	 *避免频繁开关内存节点锁pgdat->lru_lock锁*/  
@@ -4530,12 +4536,27 @@ static unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot
 				set_file_stat_in_file_stat_temp_head_list(p_file_stat);
 
 				if(is_file_stat_large_file(p_hot_cold_file_global,p_file_stat)){//大文件
-					set_file_stat_in_large_file(p_file_stat);
+					//之前是小文件，内存回收期间变成大文件，这种情况再设置大文件标记
+					if(!file_stat_in_large_file(p_file_stat)){
+					    set_file_stat_in_large_file(p_file_stat);
+					    /*这个if成立，说明是内存回收期间小文件变成大文件。因为file_stat期间不是in_temp_list状态，update函数不会
+					     * 把文件file_stat移动到大文件链表，也不会file_stat_large_count加1，只能这里加1了*/
+					    p_hot_cold_file_global->file_stat_large_count ++;
+                                        }
 					//p_hot_cold_file_global->file_stat_large_count ++;//大文件数加1，这不是新产生的大文件，已经加过1了
 					list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->file_stat_temp_large_file_head);
 				}
 				else//普通文件
+				{	
+					/*如果file_stat有大文件标记，说明之前是大文件，但是经过多轮内存回收、释放file_stat->file_area_free链表上
+					 * file_area后，不再是大文件了，就移动到global file_stat_temp_head链表。但是必须清理掉大文件标记。否则这
+					 * 会导致状态错误:file_stat_temp_head链表上的file_stat有大文件标记，将来即便再变成大文件也无法移动到大文件链表*/
+					if(file_stat_in_large_file(p_file_stat)){
+					    clear_file_stat_in_large_file(p_file_stat);
+					    p_hot_cold_file_global->file_stat_large_count --;
+					}
 					list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->file_stat_temp_head);
+				}
 			}
 		}
 		/*把这些遍历过的file_stat移动回global file_stat_temp_head或file_stat_temp_large_file_head链表头,注意是链表头。这是因为，把这些
@@ -4562,6 +4583,8 @@ static unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot
 	p_hot_cold_file_global->hot_cold_file_shrink_counter.file_area_free_count = file_area_free_count;
 	//file_stat的hot链表转移到temp链表的file_area个数
 	p_hot_cold_file_global->hot_cold_file_shrink_counter.file_area_hot_to_temp_list_count = file_area_hot_to_temp_list_count;
+	//扫描到的大文件转小文件的个数
+	p_hot_cold_file_global->hot_cold_file_shrink_counter.scan_large_to_small_count = scan_large_to_small_count;
 
 	if(shrink_page_printk_open)
 		printk("5:%s %s %d p_hot_cold_file_global:0x%llx free_pages:%d isolate_lru_pages:%d file_stat_temp_head:0x%llx file_area_free_count:%d file_area_refault_to_list_temp_count:%d file_area_hot_to_temp_list_count:%d\n",__func__,current->comm,current->pid,(u64)p_hot_cold_file_global,free_pages,isolate_lru_pages,(u64)file_stat_temp_head,file_area_free_count,file_area_refault_to_temp_list_count,file_area_hot_to_temp_list_count);
@@ -4768,7 +4791,7 @@ static int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_fi
 			clear_file_stat_in_file_stat_hot_head_list(p_file_stat);
 			set_file_stat_in_file_stat_temp_head_list(p_file_stat);//设置file_stat状态为in_head_temp_list
 			if(file_stat_in_large_file(p_file_stat)){
-				set_file_stat_in_large_file(p_file_stat);
+				//set_file_stat_in_large_file(p_file_stat);重复设置状态
 				//p_hot_cold_file_global->file_stat_large_count ++;//这不是新产生的大文件，已经加过1了 
 				list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->file_stat_temp_large_file_head);
 			}
