@@ -76,13 +76,13 @@
 #define TREE_INTERNAL_NODE 1
 
 //热file_area经过FILE_AREA_HOT_to_TEMP_AGE_DX个周期后，还没有被访问，则移动到file_area_temp链表
-#define FILE_AREA_HOT_to_TEMP_AGE_DX  3
+#define FILE_AREA_HOT_to_TEMP_AGE_DX  5
 //发生refault的file_area经过FILE_AREA_REFAULT_TO_TEMP_AGE_DX个周期后，还没有被访问，则移动到file_area_temp链表
-#define FILE_AREA_REFAULT_TO_TEMP_AGE_DX 10
+#define FILE_AREA_REFAULT_TO_TEMP_AGE_DX 20
 //普通的file_area在FILE_AREA_TEMP_TO_COLD_AGE_DX个周期内没有被访问则被判定是冷file_area，然后释放这个file_area的page
 #define FILE_AREA_TEMP_TO_COLD_AGE_DX  5
 //一个冷file_area，如果经过FILE_AREA_FREE_AGE_DX个周期，仍然没有被访问，则释放掉file_area结构
-#define FILE_AREA_FREE_AGE_DX  5
+#define FILE_AREA_FREE_AGE_DX  15
 //当一个file_area在一个周期内访问超过FILE_AREA_HOT_LEVEL次数，则判定是热的file_area
 #define FILE_AREA_HOT_LEVEL (PAGE_COUNT_IN_AREA << 1)
 
@@ -3667,16 +3667,16 @@ find_file_area:
 			if(file_area_in_free_list(p_file_area)){
 				if(file_area_in_free_list(p_file_area))
 					clear_file_area_in_free_list(p_file_area);
-
 				//file_area 的page被内存回收后，过了仅5s左右就又被访问则发生了refault，把该file_area移动到file_area_refault链表，不再参与内存回收扫描!!!!需要设个保护期限制
 				smp_rmb();
-				if(p_file_area->shrink_time && (ktime_to_ms(ktime_get()) - (p_file_area->shrink_time << 10) < 5000)){
+				if(p_file_area->shrink_time && (ktime_to_ms(ktime_get()) - (p_file_area->shrink_time << 10) < 60000)){
 					p_file_area->shrink_time = 0;
 					set_file_area_in_refault_list(p_file_area);
 					list_move(&p_file_area->file_area_list,&p_file_stat->file_area_refault);
 					//一个周期内产生的refault file_area个数
 					hot_cold_file_global_info.hot_cold_file_shrink_counter.refault_file_area_count_one_period ++;
 					hot_cold_file_global_info.all_refault_count ++;
+				        hot_cold_file_global_info.hot_cold_file_shrink_counter.refault_file_area_count_in_free_page ++;
 				}else{
 					p_file_area->shrink_time = 0;
 					//file_area此时正在被内存回收而移动到了file_stat的free_list或free_temp_list链表，则直接移动到file_stat->file_area_temp链表头
@@ -3690,6 +3690,7 @@ find_file_area:
 			  需要避免回收这种热file_area的page。于是等该file_area下次被访问，执行到这里，if成立，把该file_area移动到file_stat->file_area_refault
 			  链表。这样未来一段较长时间可以避免再次回收该file_area的page。具体详情看cold_file_isolate_lru_pages()函数里的注释*/
 			if(file_area_in_temp_list(p_file_area) && (p_file_area->shrink_time != 0)){//这个if现在应该成立不了了??????
+				printk("%s refaut 0x%llx shrink_time:%d\n",__func__,(u64)p_file_area,p_file_area->shrink_time);
 				p_file_area->shrink_time = 0;
 				clear_file_area_in_temp_list(p_file_area);
 				set_file_area_in_refault_list(p_file_area);
@@ -3697,6 +3698,7 @@ find_file_area:
 				//一个周期内产生的refault file_area个数
 				hot_cold_file_global_info.hot_cold_file_shrink_counter.refault_file_area_count_one_period ++;
 				hot_cold_file_global_info.all_refault_count ++;
+				hot_cold_file_global_info.hot_cold_file_shrink_counter.refault_file_area_count_in_free_page ++;
 			}
 		}
 		else
@@ -4455,6 +4457,7 @@ static unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot
 				spin_lock(&p_file_stat->file_stat_lock);
 				clear_file_area_in_refault_list(p_file_area);
 				set_file_area_in_temp_list(p_file_area);
+				p_hot_cold_file_global->hot_cold_file_shrink_counter.refault_file_area_count_in_free_page --;
 				list_move(&p_file_area->file_area_list,&p_file_stat->file_area_temp);
 				spin_unlock(&p_file_stat->file_stat_lock);	    
 			}else{
@@ -4507,6 +4510,8 @@ static unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot
 				list_move(&p_file_area->file_area_list,&p_file_stat->file_area_refault);
 				//在内存回收期间产生的refault file_area个数
 				p_hot_cold_file_global->hot_cold_file_shrink_counter.refault_file_area_count_in_free_page ++;
+				hot_cold_file_global_info.all_refault_count ++;
+				hot_cold_file_global_info.hot_cold_file_shrink_counter.refault_file_area_count_one_period ++;
 				spin_unlock(&p_file_stat->file_stat_lock);	    
 			}
 			else
