@@ -82,7 +82,7 @@
 //普通的file_area在FILE_AREA_TEMP_TO_COLD_AGE_DX个周期内没有被访问则被判定是冷file_area，然后释放这个file_area的page
 #define FILE_AREA_TEMP_TO_COLD_AGE_DX  5
 //一个冷file_area，如果经过FILE_AREA_FREE_AGE_DX个周期，仍然没有被访问，则释放掉file_area结构
-#define FILE_AREA_FREE_AGE_DX  15
+#define FILE_AREA_FREE_AGE_DX  10
 //当一个file_area在一个周期内访问超过FILE_AREA_HOT_LEVEL次数，则判定是热的file_area
 #define FILE_AREA_HOT_LEVEL (PAGE_COUNT_IN_AREA << 1)
 
@@ -4424,8 +4424,11 @@ static unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot
 			if(p_file_stat->file_area_last == p_file_area){
 			    p_file_stat->file_area_last = NULL;
 			}
-			//如果file_stat->file_area_free链表上的file_area长时间没有被访问则释放掉file_area结构
-			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > p_hot_cold_file_global->file_area_free_age_dx){
+			/*如果file_stat->file_area_free链表上的file_area长时间没有被访问则释放掉file_area结构。之前的代码有问题，判定释放file_area的时间是
+			 *file_area_free_age_dx，这样有问题，会导致file_area被内存回收后，在下个周期file_area立即被释放掉。原因是file_area_free_age_dx=5，
+			  file_area_temp_to_cold_age_dx=5，下个内存回收周期 global_age - file_area_free_age_dx肯定大于5*/
+			if(p_hot_cold_file_global->global_age - p_file_area->file_area_age > 
+					(p_hot_cold_file_global->file_area_free_age_dx + p_hot_cold_file_global->file_area_temp_to_cold_age_dx)){
 				file_area_free_count ++;
 				file_area_count = 0;
 				/*hot_file_update_file_status()函数中会并发把file_area从file_stat->file_area_free链表移动到file_stat->file_area_free_temp
