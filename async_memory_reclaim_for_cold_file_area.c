@@ -160,6 +160,7 @@ struct hot_cold_file_shrink_counter
 	unsigned int free_pages_count;
 	unsigned int free_pages_fail_count;
 	unsigned int page_unevictable_count; 
+	unsigned int nr_unmap_fail;
 
 	/**file_stat_has_zero_file_area_manage()函数****/
 	unsigned int scan_zero_file_area_file_stat_count;
@@ -620,6 +621,7 @@ static int hot_cold_file_print_all_file_stat(struct hot_cold_file_global *p_hot_
 static void printk_shrink_param(struct hot_cold_file_global *p_hot_cold_file_global,struct seq_file *m,int is_proc_print);
 static void iterate_supers_async(void);
 static int inline cold_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del);
+static int  cold_mmap_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del);
 
 static int walk_throuth_all_mmap_file_area(struct hot_cold_file_global *p_hot_cold_file_global);
 
@@ -901,7 +903,7 @@ keep:
 		stat->nr_unmap_fail = nr_unmap_fail;
 	}
 	hot_cold_file_global_info.hot_cold_file_shrink_counter.lock_fail_count += lock_fail_count;
-	hot_cold_file_global_info.hot_cold_file_shrink_counter.lock_fail_count += lock_fail_count;
+	hot_cold_file_global_info.hot_cold_file_shrink_counter.nr_unmap_fail += nr_unmap_fail;
 	hot_cold_file_global_info.hot_cold_file_shrink_counter.writeback_count += writeback_count;
 	hot_cold_file_global_info.hot_cold_file_shrink_counter.dirty_count += dirty_count;
 	hot_cold_file_global_info.hot_cold_file_shrink_counter.page_has_private_count += page_has_private_count;
@@ -1296,10 +1298,11 @@ retry:
 			page_unevictable_count ++;
 			goto activate_locked;
 		}
+#if 0	
 		//强制不回收mmap的page
 		if (/*!sc->may_unmap &&*/ page_mapped(page))
 			goto keep_locked;
-
+#endif
 		may_enter_fs = (sc->gfp_mask & __GFP_FS) ||
 			(PageSwapCache(page) && (sc->gfp_mask & __GFP_IO));
 
@@ -1493,7 +1496,7 @@ keep:
 	count_vm_events(PGACTIVATE, pgactivate);
 
 	hot_cold_file_global_info.hot_cold_file_shrink_counter.lock_fail_count += lock_fail_count;
-	hot_cold_file_global_info.hot_cold_file_shrink_counter.lock_fail_count += lock_fail_count;
+	hot_cold_file_global_info.hot_cold_file_shrink_counter.nr_unmap_fail += nr_unmap_fail;
 	hot_cold_file_global_info.hot_cold_file_shrink_counter.writeback_count += writeback_count;
 	hot_cold_file_global_info.hot_cold_file_shrink_counter.dirty_count += dirty_count;
 	hot_cold_file_global_info.hot_cold_file_shrink_counter.page_has_private_count += page_has_private_count;
@@ -1579,7 +1582,7 @@ static int  __hot_cold_file_isolate_lru_pages(pg_data_t *pgdat,struct page * pag
 	if (!PageLRU(page))
 		return -1;
 	//源头已经确保page不是mmap的，这里不用重复判断。但是想想还是加上吧，因为怕page中途被设置成mmap了。
-#if 1
+#if 0
 	if (/*!sc->may_unmap &&*/ page_mapped(page))
 		return -1;
 #endif
@@ -3317,7 +3320,10 @@ static unsigned int cold_file_stat_delete_all_file_area(struct hot_cold_file_glo
 	}
 
 	//把file_stat从p_hot_cold_file_global的链表中剔除，然后释放file_stat结构
-	cold_file_stat_delete(p_hot_cold_file_global,p_file_stat_del);
+	if(file_stat_in_cache_file(p_file_stat_del))
+	    cold_file_stat_delete(p_hot_cold_file_global,p_file_stat_del);
+    else
+	    cold_mmap_file_stat_delete(p_hot_cold_file_global,p_file_stat_del);
 
 	return del_file_area_count;
 }
@@ -5502,13 +5508,27 @@ static struct kprobe kp__xfs_file_mmap = {
 static struct kprobe kp__ext4_file_mmap = {
 	.symbol_name    = "ext4_file_mmap",
 };
+static int  cold_mmap_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del)
+{    
+    spin_lock(&p_hot_cold_file_global->mmap_file_global_lock);
+	//p_file_stat_del->mapping = NULL;多余操作
+	clear_file_stat_in_file_stat_temp_head_list(p_file_stat_del);
+	list_del(&p_file_stat_del->hot_cold_file_list);
+	//差点忘了释放file_stat结构，不然就内存泄漏了!!!!!!!!!!!!!!
+	kmem_cache_free(p_hot_cold_file_global->file_stat_cachep,p_file_stat_del);
+	hot_cold_file_global_info.file_stat_count --;
+	spin_unlock(&p_hot_cold_file_global->mmap_file_global_lock);
+
+    return 0;
+}
 static unsigned int cold_mmap_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat,struct file_area *p_file_area,struct page *page_buf[],int cold_page_count)
 {
     unsigned int isolate_pages = 0;
 	int i,traverse_page_count;
     struct page *page;
 	struct list_head *dst;
-	isolate_mode_t mode = ISOLATE_UNMAPPED;
+	//isolate_mode_t mode = ISOLATE_UNMAPPED;
+	isolate_mode_t mode = 0;
 	pg_data_t *pgdat = NULL;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
 	struct lruvec *lruvec = NULL,*lruvec_new = NULL;
@@ -5668,6 +5688,7 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 				/*如果page被其他进程回收了，if不成立，这些就不再对该file_area的其他page进行内存回收了，其实
 				 *也可以回收，但是处理起来很麻烦，后期再考虑优化优化细节吧!!!!!!!!!!!!!!!!!!!!!!*/
 				if(page->mapping != mapping){
+				    printk("1:%s file_stat:0x%llx file_area:0x%llx status:0x%x page->mapping != mapping!!!!!!!!!\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
 			        unlock_page(page);
 				    continue;
 				}
@@ -5875,7 +5896,7 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 {
 	int i,j,k;
     struct hot_cold_file_area_tree_node *parent_node;
-	void **page_slot_in_tree;
+	void **page_slot_in_tree = NULL;
 	unsigned int area_index_for_page;
     int ret = 0;
 	struct page *page;
@@ -5909,6 +5930,7 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 		for(j = 0;j < FILE_AREA_PER_NODE - 1;){
 
 	        printk("2:%s file_stat:0x%llx i:%d j:%d page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)(*page_slot_in_tree));
+			//如果是空树，parent_node是NULL，page_slot_in_tree是NULL，*page_slot_in_tree会导致crash
             if(NULL == *page_slot_in_tree){
 				 //第一次area_index_for_page是0时，start_page_index取值，依次是 0*4 、1*4、2*4、3*4....63*4
 				 start_page_index = (area_index_for_page + j) << PAGE_COUNT_IN_AREA_SHIFT;
@@ -5922,7 +5944,7 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 					/*这里需要优化，遍历一次radix tree就得到4个page，完全可以实现的，节省性能$$$$$$$$$$$$$$$$$$$$$$$$*/
 					page = xa_load(&mapping->i_pages, start_page_index + k);
 					//空洞file_area的page被分配了，那就分配file_area
-					if (page && !xa_is_value(page)) {
+					if (page && !xa_is_value(page) && page_mapped(page)) {
 						
 						//分配file_area并初始化，成功返回0，函数里边把新分配的file_area赋值给*page_slot_in_tree，即在radix tree的槽位
 						if(file_area_alloc_and_init(parent_node,page_slot_in_tree,page->index >> PAGE_COUNT_IN_AREA_SHIFT,p_file_stat) < 0){
@@ -5960,7 +5982,7 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 				for(k = 0;k < PAGE_COUNT_IN_AREA;k++){
 					/*探测索引是1的file_area对应的文件页page是否分配了，是的话就创建该file_area并插入radix tree*/
 					page = xa_load(&mapping->i_pages, PAGE_COUNT_IN_AREA + k);
-					if (page && !xa_is_value(page)) {
+					if (page && !xa_is_value(page) && page_mapped(page)) {
 						//此时file_area的radix tree还是空节点，现在创建根节点node，函数返回后page_slot_in_tree指向的是根节点node->slots[]数组槽位1的地址，下边
 						//file_area_alloc_and_init再分配索引是1的file_area并添加到插入radix tree，再赋值高node->slots[1]，即槽位1
 						parent_node = hot_cold_file_area_tree_lookup_and_create(&p_file_stat->hot_cold_file_area_tree_root_node,1,&page_slot_in_tree);
@@ -6024,6 +6046,8 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 	int ret;
 	struct file_area *p_file_area,*p_file_area_temp;
 	char delete_file_area_last = 0;
+	unsigned int reclaimed_pages = 0;
+	unsigned int isolate_pages = 0;
 	LIST_HEAD(file_area_temp_head);
     memset(page_buf,0,BUF_PAGE_COUNT*sizeof(struct page*));
 
@@ -6124,11 +6148,12 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 		 *向page_buf保存PAGE_COUNT_IN_AREA个page，将导致内存溢出*/
 		if(cold_page_count >= BUF_PAGE_COUNT || (BUF_PAGE_COUNT - cold_page_count <=  PAGE_COUNT_IN_AREA)){
 			//隔离page
-		    cold_mmap_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
+		    isolate_pages += cold_mmap_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
 			cold_page_count = 0;
 
 			//回收page
-			cold_file_shrink_pages(p_hot_cold_file_global,1);
+			reclaimed_pages += cold_file_shrink_pages(p_hot_cold_file_global,1);
+	        printk("3:%s file_stat:0x%llx reclaimed_pages:%d isolate_pages:%d\n",__func__,(u64)p_file_stat,reclaimed_pages,isolate_pages);
 		}
         
 		/*下一个扫描的file_area。这个对p_file_area赋值p_file_area_temp，要放到if(*already_scan_file_area_count > scan_file_area_max) break;
@@ -6174,11 +6199,12 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 	    //把本次扫描的暂存在file_area_temp_head临时链表上的不太冷的file_area移动到file_stat->file_area_temp链表尾
 	    list_splice_tail(&file_area_temp_head,&p_file_stat->file_area_temp);
 
-	printk("3:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
+	printk("4:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
     //如果本次对文件遍历结束后，有未达到BUF_PAGE_COUNT数目要回收的page，这里就隔离+回收这些page
 	if(cold_page_count){
-	    cold_mmap_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
-		cold_file_shrink_pages(p_hot_cold_file_global,1);
+	    isolate_pages += cold_mmap_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
+		reclaimed_pages += cold_file_shrink_pages(p_hot_cold_file_global,1);
+	    printk("5:%s file_stat:0x%llx reclaimed_pages:%d\n",__func__,(u64)p_file_stat,reclaimed_pages);
 	}
 
 	/*遍历file_stat->file_area_free_temp链表上已经释放page的file_area，如果长时间还没被访问，那就释放掉file_area。
@@ -6201,6 +6227,7 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
     /*文件的radix tree在遍历完一次所有的page后，可能存在空洞，于是后续还要再遍历文件的radix tree获取之前没有遍历到的page*/
     reverse_file_stat_radix_tree_hole(p_hot_cold_file_global,p_file_stat);
 
+	printk("%s already_scan_file_area_count:%d reclaimed_pages:%d isolate_pages:%d\n",__func__,*already_scan_file_area_count,reclaimed_pages,isolate_pages);
 	return 0;
 }
 /*
@@ -6228,8 +6255,8 @@ static unsigned int traverse_mmap_file_stat_get_cold_page(struct hot_cold_file_g
 	unsigned int file_page_count = p_file_stat->mapping->host->i_size >> PAGE_SHIFT;//除以4096
 	struct address_space *mapping = p_file_stat->mapping;
 
-	printk("1:%s file_stat:0x%llx file_stat->last_index:%d traverse_done:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index,p_file_stat->traverse_done);
-	if(p_file_stat->max_file_area_age || p_file_stat->recent_access_age || p_file_stat->hot_file_area_cache[0] || p_file_stat->hot_file_area_cache[1] ||p_file_stat->hot_file_area_cache[2]){                     
+	printk("1:%s file_stat:0x%llx file_stat->last_index:%d file_area_count:%d traverse_done:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index,p_file_stat->file_area_count,p_file_stat->traverse_done);
+	if(p_file_stat->max_file_area_age || p_file_stat->recent_access_age || p_file_stat->hot_file_area_cache[0] || p_file_stat->hot_file_area_cache[1] ||p_file_stat->hot_file_area_cache[2]){
 	    panic("file_stat error\n");
 	}
 
@@ -6239,8 +6266,8 @@ static unsigned int traverse_mmap_file_stat_get_cold_page(struct hot_cold_file_g
         for(i = 0;i < SCAN_PAGE_COUNT_ONCE >> PAGE_COUNT_IN_AREA_SHIFT;i++){
             for(k = 0;k < PAGE_COUNT_IN_AREA;k++){
                 /*这里需要优化，遍历一次radix tree就得到4个page，完全可以实现的，节省性能$$$$$$$$$$$$$$$$$$$$$$$$*/
-	            page = xa_load(&mapping->i_pages, p_file_stat->last_index + i);
-		        if (page && !xa_is_value(page)) {
+	            page = xa_load(&mapping->i_pages, p_file_stat->last_index + k);
+		        if (page && !xa_is_value(page) && page_mapped(page)) {
 					area_index_for_page = page->index >> PAGE_COUNT_IN_AREA_SHIFT;
 					parent_node = hot_cold_file_area_tree_lookup_and_create(&p_file_stat->hot_cold_file_area_tree_root_node,area_index_for_page,&page_slot_in_tree);
 					if(IS_ERR(parent_node)){
@@ -6262,8 +6289,9 @@ static unsigned int traverse_mmap_file_stat_get_cold_page(struct hot_cold_file_g
                     break;
 		        }
             }
+		    p_file_stat->last_index += PAGE_COUNT_IN_AREA;
 		}
-		p_file_stat->last_index += SCAN_PAGE_COUNT_ONCE;
+		//p_file_stat->last_index += SCAN_PAGE_COUNT_ONCE;
 		//if成立说明整个文件的page都扫描完了
 		if(p_file_stat->last_index >= file_page_count){
 			p_file_stat->traverse_done = 1;
@@ -6365,13 +6393,8 @@ static int walk_throuth_all_mmap_file_area(struct hot_cold_file_global *p_hot_co
 			    p_hot_cold_file_global->file_stat_last = p_file_stat_temp;
 				delete_file_stat_last = 1;
 			}
-			spin_lock(&p_hot_cold_file_global->mmap_file_global_lock);
-			clear_file_stat_in_file_stat_temp_head_list(p_file_stat);
-			list_del(&p_file_stat->hot_cold_file_list);
-			spin_unlock(&p_hot_cold_file_global->mmap_file_global_lock);
 
-			/*释放掉file_stat的所有file_area，最后释放掉file_stat。但释放file_stat用的还是p_hot_cold_file_global->global_lock锁防护
-			 *并发，这点后期需要改进!!!!!!!!!!!!!!!!!!!!!!!!!*/
+			/*释放掉file_stat的所有file_area，最后释放掉file_stat*/
 			cold_file_stat_delete_all_file_area(p_hot_cold_file_global,p_file_stat);
 			//p_file_stat = p_file_stat_temp;
 			//continue;
