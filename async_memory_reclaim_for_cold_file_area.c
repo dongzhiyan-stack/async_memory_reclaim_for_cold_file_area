@@ -5906,12 +5906,15 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
         /*一个node FILE_AREA_PER_NODE(64)个file_area。下边靠着page_slot_in_tree++依次遍历这64个file_area，如果*page_slot_in_tree
 		 *是NULL，说明是空洞file_area，之前这个file_area对应的page没有分配，也没有分配file_area，于是按照area_index_for_page<<PAGE_COUNT_IN_AREA_SHIFT
 		 *这个page索引，在此查找page是否分配了，是的话就分配file_area*/
-		for(j = 0;j < FILE_AREA_PER_NODE;j++){
+		for(j = 0;j < FILE_AREA_PER_NODE - 1;){
+
+	        printk("2:%s file_stat:0x%llx i:%d j:%d page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)(*page_slot_in_tree));
             if(NULL == *page_slot_in_tree){
 				 //第一次area_index_for_page是0时，start_page_index取值，依次是 0*4 、1*4、2*4、3*4....63*4
 				 start_page_index = (area_index_for_page + j) << PAGE_COUNT_IN_AREA_SHIFT;
 				 //page索引超过文件最大page数，结束遍历
                  if(start_page_index > file_page_count){
+			         printk("3:%s start_page_index:%d > file_page_count:%d\n",__func__,start_page_index,file_page_count);
 		             ret = 1;
 					 goto out;
 				 }
@@ -5926,12 +5929,85 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 							ret = -1;
 							goto out;
 						}
+	                    printk("3:%s file_stat:0x%llx alloc file_area:0x%llx\n",__func__,(u64)p_file_stat,(u64)(*page_slot_in_tree));
 						/*4个连续的page只要有一个在radix tree找到，分配file_area,之后就不再查找其他page了*/
 						break;
 					}
 				}
             }
-			page_slot_in_tree ++;
+			/*这里有个重大bug，当保存file_area的radix tree的file_area全被释放了，是个空树，此时area_index_for_page指向的是radix tree的根节点的指针的地址，
+			 * 即area_index_for_page指向 p_file_stat->hot_cold_file_area_tree_root_node->root_node的地址，然后这里的page_slot_in_tree ++就有问题了。
+			 * 原本的设计，area_index_for_page最初指向的是node节点node->slot[64]数组槽位0的slot的地址，然后page_slot_in_tree++依次指向槽位0到槽位63
+			 * 的地址。然后看*page_slot_in_tree是否是NULL，是的话说明file_area已经分配。否则说明是空洞file_area，那就要执行xa_load()探测对应索引
+			 * 的文件页是否已经分配并插入radix tree(保存page指针的radix tree)了，是的话就file_area_alloc_and_init分配file_area并保存到
+			 * page_slot_in_tree指向的保存file_area的radix tree。..........但是，现在保存file_area的radix tree，是个空树，area_index_for_page
+			 * 经过上边hot_cold_file_area_tree_lookup探测索引是0的file_area后，指向的是该radix tree的根节点指针的地址，
+			 * 即p_file_stat->hot_cold_file_area_tree_root_node->root_node的地址。没办法，这是radix tree的特性，如果只有一个索引是0的成员，该成员
+			 * 就是保存在radix tree的根节点指针里。如此，page_slot_in_tree ++就内存越界了，越界到p_file_stat->hot_cold_file_area_tree_root_node
+			 * 成员的后边，即p_file_stat的file_stat_lock、max_file_area_age、recent_access_age等成员里，然后对应page分配的话，就要创建新的
+			 * file_area并保存到 p_file_stat的file_stat_lock、max_file_area_age、recent_access_age里，导致这些应该是0的成员但却很大。
+			 *
+			 * 解决办法是，如果该radix tree是空树，先xa_load()探测索引是0的file_aera对应的索引是0~3的文件页page是否分配了，是的话就创建file_area并保存到
+			 * radix tree的p_file_stat->hot_cold_file_area_tree_root_node->root_node。然后不令page_slot_in_tree ++，而是xa_load()探测索引是1的file_aera
+			 * 对应的索引是4~7的文件页page是否分配了，是的话，直接执行hot_cold_file_area_tree_lookup_and_create创建这个file_area，不是探测结束。
+			 * 并且要令p_file_stat->last_index恢复0，这样下次执行该函数还是从索引是0的file_area开始探测，然后探测索引是1的file_area对应的文件页是否分配了。
+			 * 这样有点啰嗦，并且会重复探测索引是0的file_area。如果索引是1的file_area的文件页page没分配，那索引是2的file_area的文件页page被分配了。
+			 * 现在的代码就有问题了，不会针对这这种情况分配索引是2的file_area*/
+			//page_slot_in_tree ++;
+			
+            if((NULL == parent_node) && (0 == j) && (0 == area_index_for_page)){
+	            printk("4:%s file_stat:0x%llx page_slot_in_tree:0x%llx_0x%llx j:%d\n",__func__,(u64)p_file_stat,(u64)page_slot_in_tree,(u64)&p_file_stat->hot_cold_file_area_tree_root_node.root_node,j);
+				for(k = 0;k < PAGE_COUNT_IN_AREA;k++){
+					/*探测索引是1的file_area对应的文件页page是否分配了，是的话就创建该file_area并插入radix tree*/
+					page = xa_load(&mapping->i_pages, PAGE_COUNT_IN_AREA + k);
+					if (page && !xa_is_value(page)) {
+						//此时file_area的radix tree还是空节点，现在创建根节点node，函数返回后page_slot_in_tree指向的是根节点node->slots[]数组槽位1的地址，下边
+						//file_area_alloc_and_init再分配索引是1的file_area并添加到插入radix tree，再赋值高node->slots[1]，即槽位1
+						parent_node = hot_cold_file_area_tree_lookup_and_create(&p_file_stat->hot_cold_file_area_tree_root_node,1,&page_slot_in_tree);
+		                if(IS_ERR(parent_node)){
+			                ret = -1;
+			                printk("%s hot_cold_file_area_tree_lookup_and_create fail\n",__func__);
+			                goto out;
+		                }
+	
+                        if(NULL == parent_node || *page_slot_in_tree != NULL){
+						    panic("%s parent_node:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)parent_node,(u64)(*page_slot_in_tree));
+						}
+						//分配file_area并初始化，成功返回0，函数里边把新分配的file_area赋值给*page_slot_in_tree，即在radix tree的槽位
+						if(file_area_alloc_and_init(parent_node,page_slot_in_tree,1,p_file_stat) < 0){
+							ret = -1;
+							goto out;
+						}
+	                    printk("5:%s file_stat:0x%llx alloc file_area:0x%llx\n",__func__,(u64)p_file_stat,(u64)(*page_slot_in_tree));
+						/*4个连续的page只要有一个在radix tree找到，分配file_area,之后就不再查找其他page了*/
+						break;
+					}
+				}
+
+                /*如果parent_node不是NULL。说明上边索引是0的file_area的对应文件页page分配了，创建的根节点，parent_node就是这个根节点。并且，令j加1.
+				 *这样下边再就j加1，j就是2了，page_slot_in_tree = parent_node.slots[j]指向的是索引是2的file_area，然后探测对应文件页是否分配了。
+				 *因为索引是0、1的file_area已经探测过了。如果 parent_node是NULL，那说明索引是1的file_area对应的文件页page没分配，上边也没有创建
+				 *根节点。于是令p_file_stat->last_index清0，直接goto out，这样下次执行该函数，还是从索引是0的file_area开始探测。这样有个问题，如经
+				 *索引是1的file_area对应文件页没分配，这类直接goto out了，那索引是2的file_area对应的文件页分配，就不理会了。这种可能是存在的！索引
+				 *是2的file_area的文件页page也应该探测呀，后溪再改进吧
+				 */
+				if(parent_node){
+				    j ++;
+				}else{
+					p_file_stat->last_index = 0;
+				    goto out;
+				}
+			}
+			//j加1令page_slot_in_tree指向下一个file_area
+			j++;
+			//不用page_slot_in_tree ++了，虽然性能好点，但是内存越界了也不知道。page_slot_in_tree指向下一个槽位的地址
+			page_slot_in_tree = &parent_node->slots[j];
+		#ifdef __LITTLE_ENDIAN//这个判断下端模式才成立
+			if((u64)page_slot_in_tree < (u64)(&parent_node->slots[0]) || (u64)page_slot_in_tree > (u64)(&parent_node->slots[TREE_MAP_SIZE])){		
+			    panic("%s page_slot_in_tree:0x%llx error 0x%llx_0x%llx\n",__func__,(u64)page_slot_in_tree,(u64)(&parent_node->slots[0]),(u64)(&parent_node->slots[TREE_MAP_SIZE]));
+			}
+       #endif	
+			//page_slot_in_tree ++;
 		}
 		//area_index_for_page的取值，0，后续依次是64*1、64*2、64*3等等，
 		area_index_for_page += FILE_AREA_PER_NODE;
@@ -6153,6 +6229,10 @@ static unsigned int traverse_mmap_file_stat_get_cold_page(struct hot_cold_file_g
 	struct address_space *mapping = p_file_stat->mapping;
 
 	printk("1:%s file_stat:0x%llx file_stat->last_index:%d traverse_done:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index,p_file_stat->traverse_done);
+	if(p_file_stat->max_file_area_age || p_file_stat->recent_access_age || p_file_stat->hot_file_area_cache[0] || p_file_stat->hot_file_area_cache[1] ||p_file_stat->hot_file_area_cache[2]){                     
+	    panic("file_stat error\n");
+	}
+
 	/*p_file_stat->traverse_done非0，说明还没遍历完一次文件radix tree上所有的page，那就遍历一次，每4个page分配一个file_area*/
     if(0 == p_file_stat->traverse_done){
         /*第一次扫描文件的page，每个周期扫描SCAN_PAGE_COUNT_ONCE个page，一直到扫描完所有的page。4个page一组，每组分配一个file_area结构*/
