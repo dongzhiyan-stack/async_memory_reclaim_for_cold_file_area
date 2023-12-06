@@ -2966,7 +2966,9 @@ static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup_and_c
 	*page_slot_in_tree = slot;
 	return node;
 }
-//按照索引area_index从radix tree查找file_area，查找失败则创建node节点
+/*按照索引area_index从radix tree查找file_area，查找失败则创建node节点
+ *空树时函数返回NULL并且page_slot_in_tree指向root->root_node的地址。当传入索引很大找不到file_area时，函数返回NULL并且page_slot_in_tree不会被赋值(保持原值NULL)
+ * */
 static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup(struct hot_cold_file_area_tree_root *root,
 		unsigned long area_index,void ***page_slot_in_tree)
 {
@@ -3653,7 +3655,8 @@ already_alloc:
 		parent_node = hot_cold_file_area_tree_lookup(&p_file_stat->hot_cold_file_area_tree_root_node,area_index_for_page,&page_slot_in_tree);
 
 		/*page_slot_in_tree默认值是NULL，而如果hot_cold_file_area_tree_lookup()空树时对 *page_slot_in_tree 没有赋值，
-		 *就会导致直接使用if(*page_slot_in_tree)因为page_slot_in_tree是NULL而crash。此时只能靠返回值NULL过滤掉*/
+		 *就会导致直接使用if(*page_slot_in_tree)因为page_slot_in_tree是NULL而crash。此时只能靠返回值NULL过滤掉。NO、NO、NO，错了，错了,
+		 空树时函数返回NULL并且page_slot_in_tree指向root->root_node的地址。当传入索引很大找不到file_area时，函数返回NULL并且page_slot_in_tree不会被赋值(保持原值NULL)*/
 		if(parent_node){
 			if(*page_slot_in_tree){
 				p_file_area = *page_slot_in_tree;
@@ -4823,7 +4826,7 @@ static void printk_shrink_param(struct hot_cold_file_global *p_hot_cold_file_glo
 	if(is_proc_print){
 		seq_printf(m,"scan_file_area:%d scan_file_stat:%d scan_delete_file_stat:%d scan_cold_file_area:%d scan_large_to_small:%d scan_fail_file_stat:%d file_area_refault_to_temp:%d file_area_free:%d file_area_hot_to_temp:%d-%d\n",p->scan_file_area_count,p->scan_file_stat_count,p->scan_delete_file_stat_count,p->scan_cold_file_area_count,p->scan_large_to_small_count,p->scan_fail_file_stat_count,p->file_area_refault_to_temp_list_count,p->file_area_free_count,p->file_area_hot_to_temp_list_count,p->file_area_hot_to_temp_list_count2);
 
-		seq_printf(m,"isolate_pages:%d del_file_stat:%d del_file_area:%d lock_fail_count:%d writeback:%d dirty:%d page_has_private:%d mapping:%d free_pages:%d free_pages_fail:%d scan_zero_file_area_file_stat_count:%d unevictable:%d lru_lock_contended:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count,p->scan_zero_file_area_file_stat_count,p->page_unevictable_count,p->lru_lock_contended_count);
+		seq_printf(m,"isolate_pages:%d del_file_stat:%d del_file_area:%d lock_fail_count:%d writeback:%d dirty:%d page_has_private:%d mapping:%d free_pages:%d free_pages_fail:%d scan_zero_file_area_file_stat_count:%d unevictable:%d lru_lock_contended:%d nr_unmap_fail:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count,p->scan_zero_file_area_file_stat_count,p->page_unevictable_count,p->lru_lock_contended_count,p->nr_unmap_fail);
 
 		seq_printf(m,"file_area_delete_in_cache:%d file_area_cache_hit:%d file_area_access_in_free_page:%d hot_file_area_in_free_page:%d refault_file_area_in_free_page:%d hot_file_area_one_period:%d refault_file_area_one_period:%d find_file_area_from_tree:%d all_file_area_access:%d small_file_page_refuse:%d find_file_area_from_last:%d lru_lock_count:%d\n",p->file_area_delete_in_cache_count,p->file_area_cache_hit_count,p->file_area_access_count_in_free_page,p->hot_file_area_count_in_free_page,p_hot_cold_file_global->refault_file_area_count_in_free_page,p->hot_file_area_count_one_period,p->refault_file_area_count_one_period,p->find_file_area_from_tree_not_lock_count,p->all_file_area_access_count,p->small_file_page_refuse_count,p->find_file_area_from_last_count,p->lru_lock_count);
 
@@ -4833,7 +4836,7 @@ static void printk_shrink_param(struct hot_cold_file_global *p_hot_cold_file_glo
 	{
 		printk("scan_file_area_count:%d scan_file_stat_count:%d scan_delete_file_stat_count:%d scan_cold_file_area_count:%d scan_large_to_small_count:%d scan_fail_file_stat_count:%d file_area_refault_to_temp_list_count:%d file_area_free_count:%d file_area_hot_to_temp_list_count:%d-%d\n",p->scan_file_area_count,p->scan_file_stat_count,p->scan_delete_file_stat_count,p->scan_cold_file_area_count,p->scan_large_to_small_count,p->scan_fail_file_stat_count,p->file_area_refault_to_temp_list_count,p->file_area_free_count,p->file_area_hot_to_temp_list_count,p->file_area_hot_to_temp_list_count2);
 
-		printk("isolate_lru_pages:%d del_file_stat_count:%d del_file_area_count:%d lock_fail_count:%d writeback_count:%d dirty_count:%d page_has_private_count:%d mapping_count:%d free_pages_count:%d free_pages_fail_count:%d scan_zero_file_area_file_stat_count:%d unevictable:%d lru_lock_contended:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count,p->scan_zero_file_area_file_stat_count,p->page_unevictable_count,p->lru_lock_contended_count);
+		printk("isolate_lru_pages:%d del_file_stat_count:%d del_file_area_count:%d lock_fail_count:%d writeback_count:%d dirty_count:%d page_has_private_count:%d mapping_count:%d free_pages_count:%d free_pages_fail_count:%d scan_zero_file_area_file_stat_count:%d unevictable:%d lru_lock_contended:%d nr_unmap_fail:%d\n",p->isolate_lru_pages,p->del_file_stat_count,p->del_file_area_count,p->lock_fail_count,p->writeback_count,p->dirty_count,p->page_has_private_count,p->mapping_count,p->free_pages_count,p->free_pages_fail_count,p->scan_zero_file_area_file_stat_count,p->page_unevictable_count,p->lru_lock_contended_count,p->nr_unmap_fail);
 
 		printk("file_area_delete_in_cache_count:%d file_area_cache_hit_count:%d file_area_access_count_in_free_page:%d hot_file_area_count_in_free_page:%d refault_file_area_count_in_free_page:%d hot_file_area_count_one_period:%d refault_file_area_count_one_period:%d find_file_area_from_tree_not_lock_count:%d all_file_area_access:%d small_file_page_refuse_count:%d find_file_area_from_last:%d lru_lock_count:%d\n",p->file_area_delete_in_cache_count,p->file_area_cache_hit_count,p->file_area_access_count_in_free_page,p->hot_file_area_count_in_free_page,p_hot_cold_file_global->refault_file_area_count_in_free_page,p->hot_file_area_count_one_period,p->refault_file_area_count_one_period,p->find_file_area_from_tree_not_lock_count,p->all_file_area_access_count,p->small_file_page_refuse_count,p->find_file_area_from_last_count,p->lru_lock_count);
 
@@ -4928,12 +4931,13 @@ static int walk_throuth_all_file_area(struct hot_cold_file_global *p_hot_cold_fi
 	unsigned int cold_file_area_count;
 	unsigned int file_area_hot_to_temp_list_count = 0;
 	unsigned int del_file_stat_count = 0,del_file_area_count = 0;
-	//每个周期global_age加1
-	hot_cold_file_global_info.global_age ++;
+	unsigned int nr_unmap_fail;
 
-
-	memset(&p_hot_cold_file_global->hot_cold_file_shrink_counter,0,sizeof(struct hot_cold_file_shrink_counter));
-
+	nr_unmap_fail = hot_cold_file_global_info.hot_cold_file_shrink_counter.nr_unmap_fail;
+	//memset(&p_hot_cold_file_global->hot_cold_file_shrink_counter,0,sizeof(struct hot_cold_file_shrink_counter));
+	hot_cold_file_global_info.hot_cold_file_shrink_counter.nr_unmap_fail =  nr_unmap_fail;
+	return 0;
+	
 	scan_file_stat_max = 10;
 	scan_file_area_max = 1024;
 	/*遍历hot_cold_file_global->file_stat_temp_large_file_head链表尾巴上边的大文件file_stat，然后遍历这些大文件file_stat的file_stat->file_area_temp
@@ -5233,6 +5237,9 @@ static int hot_cold_file_thread(void *p){
 		}
 		if(test_bit(ASYNC_MEMORY_RECLAIM_ENABLE, &async_memory_reclaim_status))
 		{
+			
+	        //每个周期global_age加1
+	        hot_cold_file_global_info.global_age ++;
 			walk_throuth_all_file_area(p_hot_cold_file_global);
 			walk_throuth_all_mmap_file_area(p_hot_cold_file_global);
 		}
@@ -5891,6 +5898,7 @@ static int reverse_file_area_refault_and_free_list(struct hot_cold_file_global *
 
 	return scan_file_area_count;
 }
+#if 0 //这段源码不要删除，牵涉到一个内存越界的重大bug
 /*文件的radix tree在遍历完一次所有的page后，可能存在空洞，于是后续还要再遍历文件的radix tree获取之前没有遍历到的page*/
 static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat)
 {
@@ -5901,7 +5909,7 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
     int ret = 0;
 	struct page *page;
 	unsigned int file_page_count = p_file_stat->mapping->host->i_size >> PAGE_SHIFT;//除以4096
-	unsigned int start_page_index;
+	unsigned int start_page_index = 0;
     struct address_space *mapping = p_file_stat->mapping;
 
 	//p_file_stat->traverse_done是0，说明还没有遍历完一次文件的page，那先返回
@@ -5936,6 +5944,26 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 				 start_page_index = (area_index_for_page + j) << PAGE_COUNT_IN_AREA_SHIFT;
 				 //page索引超过文件最大page数，结束遍历
                  if(start_page_index > file_page_count){
+			         printk("3:%s start_page_index:%d > file_page_count:%d\n",__func__,start_page_index,file_page_count);
+		             ret = 1;
+					 goto out;
+				 }
+				 for(k = 0;k < PAGE_COUNT_IN_AREA;k++){
+					/*这里需要优化，遍历一次radix tree就得到4个page，完全可以实现的，节省性能$$$$$$$$$$$$$$$$$$$$$$$$*/
+					page = xa_load(&mapping->i_pages, start_page_index + k);
+					//空洞file_area的page被分配了，那就分配file_area
+					if (page && !xa_is_value(page) && page_mapped(page)) {
+						
+						//分配file_area并初始化，成功返回0，函数里边把新分配的file_area赋值给*page_slot_in_tree，即在radix tree的槽位
+						if(file_area_alloc_and_init(parent_node,page_slot_in_tree,page->index >> PAGE_COUNT_IN_AREA_SHIFT,p_file_stat) < 0){
+							ret = -1;
+							goto out;
+						}
+	                    printk("3:%s file_stat:0x%llx alloc file_area:0x%llx\n",__func__,(u64)p_file_stat,(u64)(*page_slot_in_tree));
+						/*4个连续的page只要有一个在radix tree找到，分配file_area,之后就不再查找其他page了*/
+						break;
+					}
+				}
 			         printk("3:%s start_page_index:%d > file_page_count:%d\n",__func__,start_page_index,file_page_count);
 		             ret = 1;
 					 goto out;
@@ -6037,8 +6065,224 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 	//p_file_stat->last_index记录下次要查找的第一个node节点的file_area的索引
 	p_file_stat->last_index = area_index_for_page;
 out:
+    if(start_page_index > file_page_count){
+	    //p_file_stat->last_index清0，下次从头开始扫描文件页
+	    p_file_stat->last_index = 0;
+	}
 	return ret;
 }
+#else
+static int check_page_exist_and_create_file_area(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat *p_file_stat,struct hot_cold_file_area_tree_node **_parent_node,void ***_page_slot_in_tree,unsigned int area_index)
+{
+	/*空树时函数返回NULL并且page_slot_in_tree指向root->root_node的地址。当传入索引很大找不到file_area时，函数返回NULL并且page_slot_in_tree不会被赋值(保持原值NULL)*/
+
+	int ret = 0;
+	int k;
+	unsigned int start_page_index;
+	struct page *page;
+    struct address_space *mapping = p_file_stat->mapping;
+    void **page_slot_in_tree = *_page_slot_in_tree;
+	struct hot_cold_file_area_tree_node *parent_node = *_parent_node;
+
+	start_page_index = (area_index) << PAGE_COUNT_IN_AREA_SHIFT;
+	/*探测area_index对应file_area索引的page是否分配了，分配的话则分配对应的file_area。但是如果父节点不存在，需要先分配父节点*/
+	for(k = 0;k < PAGE_COUNT_IN_AREA;k++){
+		/*探测索引是1的file_area对应的文件页page是否分配了，是的话就创建该file_area并插入radix tree*/
+		page = xa_load(&mapping->i_pages, start_page_index + k);
+		//area_index对应file_area索引的page存在
+		if (page && !xa_is_value(page) && page_mapped(page)){
+			//父节点不存在则创建父节点，并令page_slot_in_tree指向area_index索引对应file_area在父节点的槽位parent_node.slots[槽位索引]槽位地址
+			if(NULL == parent_node){//parent_node是NULL，page_slot_in_tree一定也是NULL
+				parent_node = hot_cold_file_area_tree_lookup_and_create(&p_file_stat->hot_cold_file_area_tree_root_node,area_index,&page_slot_in_tree);
+				if(IS_ERR(parent_node)){
+					ret = -1;
+					printk("%s hot_cold_file_area_tree_lookup_and_create fail\n",__func__);
+					goto out;
+				}
+
+			}
+			/*到这里，page_slot_in_tree一定不是NULL，是则触发crash。如果parent_node是NULL是有可能的，当radix tree是空树时。查找索引是0的file_area
+			 *时，parent_node是NULL，page_slot_in_tree指向p_file_stat->hot_cold_file_area_tree_root_node->root_node的地址。否则，其他情况触发crash*/
+			if((area_index != 0 && NULL == parent_node) || (NULL == page_slot_in_tree)){
+				panic("%s parent_node:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)parent_node,(u64)(*page_slot_in_tree));
+			}
+			//分配file_area并初始化，成功返回0，函数里边把新分配的file_area赋值给*page_slot_in_tree，即在radix tree的槽位
+			if(file_area_alloc_and_init(parent_node,page_slot_in_tree,area_index,p_file_stat) < 0){
+				ret = -1;
+				goto out;
+			}
+
+            //令_page_slot_in_tree指向新分配的file_area在radix tree的parent_node.slots[槽位索引]槽位地址
+			if(NULL == *_page_slot_in_tree)
+                *_page_slot_in_tree = page_slot_in_tree;
+			
+			//新分配的parent_node赋值给*_parent_node
+			if(NULL == *_parent_node)
+			    *_parent_node = parent_node;
+
+		    //只要有一个page在radix tree找到，分配file_area,之后就不再查找其他page了
+			break;
+		}
+	}
+out:
+	return ret;
+}
+/*文件的radix tree在遍历完一次所有的page后，可能存在空洞，于是后续还要再遍历文件的radix tree获取之前没有遍历到的page*/
+static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat)
+{
+	int i,j;
+    struct hot_cold_file_area_tree_node *parent_node;
+	void **page_slot_in_tree = NULL;
+	unsigned int area_index_for_page;
+    int ret = 0;
+	unsigned int file_page_count = p_file_stat->mapping->host->i_size >> PAGE_SHIFT;//除以4096
+	unsigned int start_page_index = 0;
+
+	//p_file_stat->traverse_done是0，说明还没有遍历完一次文件的page，那先返回
+	if(0 == p_file_stat->traverse_done)
+		return ret;
+
+	printk("1:%s file_stat:0x%llx file_stat->last_index:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index);
+
+	//p_file_stat->last_index初值是0，后续依次是64*1、64*2、64*3等等，
+	area_index_for_page = p_file_stat->last_index;
+
+    //一次遍历SCAN_FILE_AREA_NODE_COUNT个node，一个node 64个file_area
+	for(i = 0;i < SCAN_FILE_AREA_NODE_COUNT;i++){
+		//每次必须对page_slot_in_tree赋值NULL，下边hot_cold_file_area_tree_lookup()如果没找到对应索引的file_area，page_slot_in_tree还是NULL
+		page_slot_in_tree = NULL;
+
+		/*查找索引0、64*1、64*2、64*3等等的file_area的地址，保存到page_slot_in_tree。page_slot_in_tree指向的是每个node节点的第一个file_area，
+		 *每个node节点一共64个file_area，都保存在node节点的slots[64]数组。下边的for循环一次查找node->slots[0]~node->slots[63]，如果是NULL，
+		 *说明还没有分配file_area，是空洞，那就分配file_area并添加到radix tree。否则说明file_area已经分配了，就不用再管了*/
+
+		/*不能用hot_cold_file_area_tree_lookup_and_create，如果是空树，但是去探测索引是1的file_area，此时会直接分配索引是1的file_area对应的node节点
+		 *并插入radix tree，注意是分配node节点。而根本不管索引是1的file_area对应的文件页page是否分配了。这样会分配很多没用的node节点，而不管对应索引的
+		 *file_area的文件页是否分配了，浪费内存。这里只能探测file_area是否存在，不能node节点*/
+		//parent_node = hot_cold_file_area_tree_lookup_and_create(&p_file_stat->hot_cold_file_area_tree_root_node,area_index_for_page,&page_slot_in_tree);
+
+		/*空树时函数返回NULL并且page_slot_in_tree指向root->root_node的地址。当传入索引很大找不到file_area时，函数返回NULL并且page_slot_in_tree不会被赋值(保持原值NULL)*/
+		parent_node = hot_cold_file_area_tree_lookup(&p_file_stat->hot_cold_file_area_tree_root_node,area_index_for_page,&page_slot_in_tree);
+		if(IS_ERR(parent_node)){
+			ret = -1;
+			printk("2:%s hot_cold_file_area_tree_lookup_and_create fail\n",__func__);
+			goto out;
+		}
+        /*一个node FILE_AREA_PER_NODE(64)个file_area。下边靠着page_slot_in_tree++依次遍历这64个file_area，如果*page_slot_in_tree
+		 *是NULL，说明是空洞file_area，之前这个file_area对应的page没有分配，也没有分配file_area，于是按照area_index_for_page<<PAGE_COUNT_IN_AREA_SHIFT
+		 *这个page索引，在此查找page是否分配了，是的话就分配file_area*/
+		for(j = 0;j < FILE_AREA_PER_NODE - 1;){
+			/* 1：hot_cold_file_area_tree_lookup中找到对应索引的file_area，parent_node非NULL，page_slot_in_tree和*page_slot_in_tree都非NULL
+			 * 2：hot_cold_file_area_tree_lookup中没找到对应索引的file_area，但是父节点存在，parent_node非NULL，page_slot_in_tree非NULL，*page_slot_in_tree是NULL
+			 * 3：hot_cold_file_area_tree_lookup中没找到对应索引的file_area，父节点也不存在，parent_node是NULL，page_slot_in_tree是NULL，此时不能出现*page_slot_in_tree
+			 * 另外，如果radix tree是空树，lookup索引是0的file_area后，page_slot_in_tree指向p_file_stat->hot_cold_file_area_tree_root_node->root_node的地址，
+			 *    parent_node是NULL，page_slot_in_tree和*page_slot_in_tree都非NULL
+			 *
+			 * 简单说，
+			 * 情况1：只要待查找索引的file_area的父节点存在，parent_node不是NULL，page_slot_in_tree也一定不是NULL，page_slot_in_tree指向保存
+			 * file_area指针在父节点的槽位地址，即parent_node.slot[槽位索引]的地址。如果file_area存在则*page_slot_in_tree非NULL，否则*page_slot_in_tree是NULL
+			 * 情况2：待查找的file_area的索引太大，没找到父节点，parent_node是NULL，page_slot_in_tree也是NULL，此时不能用*page_slot_in_tree，会crash
+			 * 情况3：radix tree是空树，lookup索引是0的file_area后， parent_node是NULL，page_slot_in_tree非NULL，指向p_file_stat->hot_cold_file_area_tree_root_node->root_node的地址
+			 * */
+
+			start_page_index = area_index_for_page << PAGE_COUNT_IN_AREA_SHIFT;
+            if(start_page_index > file_page_count){
+			    printk("3:%s start_page_index:%d > file_page_count:%d\n",__func__,start_page_index,file_page_count);
+			    goto out;
+		    }
+			if(page_slot_in_tree)
+	            printk("4:%s file_stat:0x%llx i:%d j:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
+			else
+	            printk("4:%s file_stat:0x%llx i:%d j:%d parent_node:0x%llx page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)parent_node,(u64)page_slot_in_tree);
+           
+			/* (NULL == page_slot_in_tree)：对应情况2，radix tree现在节点太少，待查找的file_area索引太大找不到父节点和file_area的槽位，
+			 * parent_node 和 page_slot_in_tree都是NULL。那就执行check_page_exist_and_create_file_area()分配父节点 parent_node，并令page_slot_in_tree指向
+			 * parent_node->slots[槽位索引]槽位，然后分配对应索引的file_area并保存到parent_node->slots[槽位索引]
+			 *
+			 * (NULL!= page_slot_in_tree && NULL == *page_slot_in_tree)对应情况1和情况3。情况1：找到对应索引的file_area的槽位，即parent_node.slot[槽位索引]，
+			 * parent_node 和 page_slot_in_tree都非NULL，但*page_slot_in_tree是NULL，那就执行check_page_exist_and_create_file_area()分配对应索引的file_area结构
+			 * 并保存到parent_node.slot[槽位索引]。 情况3：radix tree是空树，lookup索引是0的file_area后， parent_node是NULL，page_slot_in_tree非NULL，
+			 * page_slot_in_tree指向p_file_stat->hot_cold_file_area_tree_root_node->root_node的地址，但如果*page_slot_in_tree是NULL，说明file_area没有分配，
+			 * 那就执行check_page_exist_and_create_file_area()分配索引是0的file_area并保存到 p_file_stat->hot_cold_file_area_tree_root_node->root_node。
+			 *
+			 * */
+			if((NULL == page_slot_in_tree)  || (NULL!= page_slot_in_tree && NULL == *page_slot_in_tree)){
+			    if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page + j) < 0){
+			        printk("5:%sheck_page_exist_and_create_file_area fail\n",__func__);
+					ret = -1;
+			        goto out;
+                }
+			}
+			if(page_slot_in_tree)
+	            printk("6:%s file_stat:0x%llx i:%d j:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
+			else
+	            printk("6:%s file_stat:0x%llx i:%d j:%d parent_node:0x%llx page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)parent_node,(u64)page_slot_in_tree);
+/*
+			//情况1：只要待查找索引的file_area的父节点存在，parent_node不是NULL，page_slot_in_tree也一定不是NULL
+			if(parent_node){
+				//待查找索引的file_area不存在，则探测它对应的page是否存在，存在的话则分配file_area
+                if(NULL == *page_slot_in_tree){
+					if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page + j) < 0){
+					    goto out;
+					}
+				}
+				//待查找索引的file_area存在，什么都不用干
+                else{}
+			}
+			else
+			{
+				//情况2：待查找的file_area的索引太大，没找到父节点，parent_node是NULL，page_slot_in_tree也是NULL，此时不能用*page_slot_in_tree，会crash
+				if(NULL == page_slot_in_tree){
+					if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page+j) < 0){
+					    goto out;
+					}
+					//到这里，如果指定索引的file_area的page存在，则创建父节点和file_area，parent_node和page_slot_in_tree不再是NULL，*ppage_slot_in_tree也非NULL
+				}
+				//情况3：radix tree是空树，lookup索引是0的file_area后， parent_node是NULL，page_slot_in_tree非NULL，指向*p_file_stat->hot_cold_file_area_tree_root_node->root_node的地址
+			    else{
+			        if((0 == j) && (0 == area_index_for_page)&& (page_slot_in_tree ==  &p_file_stat->hot_cold_file_area_tree_root_node.root_node)){
+						//如果索引是0的file_area不存在，则探测对应page是否存在，存在的话创建索引是0的file_area，不用创建父节点，file_area指针保存在p_file_stat->hot_cold_file_area_tree_root_node->root_node
+						if(NULL == *page_slot_in_tree){
+					        if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page + j) < 0){
+					            goto out;
+					        }
+						}
+					}else{
+					    if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page + j) < 0){
+					        goto out;
+					    }
+						//这里可能进入，空树时，探测索引很大的file_area
+					    printk("%s j:%d area_index_for_page:%d page_slot_in_tree:0x%llx_0x%llx error!!!!!!!!!\n",__func__,j,area_index_for_page,(u64)page_slot_in_tree,(u64)&p_file_stat->hot_cold_file_area_tree_root_node.root_node);
+					}
+				}
+			}
+*/			
+			//j加1令page_slot_in_tree指向下一个file_area
+			j++;
+			if(parent_node){
+				//不用page_slot_in_tree ++了，虽然性能好点，但是内存越界了也不知道。page_slot_in_tree指向下一个槽位的地址
+				page_slot_in_tree = &parent_node->slots[j];
+			#ifdef __LITTLE_ENDIAN//这个判断下端模式才成立
+				if((u64)page_slot_in_tree < (u64)(&parent_node->slots[0]) || (u64)page_slot_in_tree > (u64)(&parent_node->slots[TREE_MAP_SIZE])){		
+					panic("%s page_slot_in_tree:0x%llx error 0x%llx_0x%llx\n",__func__,(u64)page_slot_in_tree,(u64)(&parent_node->slots[0]),(u64)(&parent_node->slots[TREE_MAP_SIZE]));
+				}
+		   #endif
+			}
+        }
+		//area_index_for_page的取值，0，后续依次是64*1、64*2、64*3等等，
+		area_index_for_page += FILE_AREA_PER_NODE;
+    }
+	//p_file_stat->last_index记录下次要查找的第一个node节点的file_area的索引
+	p_file_stat->last_index = area_index_for_page;
+out:
+    if((0 == ret) && (area_index_for_page << PAGE_COUNT_IN_AREA_SHIFT > file_page_count)){
+	    printk("7:%s last_index = 0 last_index:%d area_index_for_page:%d file_page_count:%d\n",__func__,p_file_stat->last_index,area_index_for_page << PAGE_COUNT_IN_AREA_SHIFT,file_page_count);
+	    //p_file_stat->last_index清0，下次从头开始扫描文件页
+	    p_file_stat->last_index = 0;
+	}
+	return ret;
+}
+#endif
 static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat,unsigned int scan_file_area_max,unsigned int *already_scan_file_area_count)
 {
     struct page *page_buf[BUF_PAGE_COUNT];
@@ -6204,7 +6448,7 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 	if(cold_page_count){
 	    isolate_pages += cold_mmap_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
 		reclaimed_pages += cold_file_shrink_pages(p_hot_cold_file_global,1);
-	    printk("5:%s file_stat:0x%llx reclaimed_pages:%d\n",__func__,(u64)p_file_stat,reclaimed_pages);
+	    printk("5:%s file_stat:0x%llx reclaimed_pages:%d isolate_pages:%d\n",__func__,(u64)p_file_stat,reclaimed_pages,isolate_pages);
 	}
 
 	/*遍历file_stat->file_area_free_temp链表上已经释放page的file_area，如果长时间还没被访问，那就释放掉file_area。
