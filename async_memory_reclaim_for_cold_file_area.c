@@ -382,15 +382,19 @@ struct hot_cold_file_global
 
 	/**针对mmap文件新增的****************************/
 	//新分配的文件file_stat默认添加到file_stat_temp_head链表
+	struct list_head mmap_file_stat_uninit_head;
+	//当一个文件的page都遍历完后，file_stat移动到这个链表
 	struct list_head mmap_file_stat_temp_head;
-	//0个file_area的file_stat移动到这个链表
-	struct list_head mmap_file_stat_zero_file_area_head;
-	//inode被删除的文件的file_stat移动到这个链表
-	struct list_head mmap_file_stat_delete_head;
-	//大文件
+	//文件file_stat个数超过阀值移动到这个链表
 	struct list_head mmap_file_stat_temp_large_file_head;
 	//热文件
 	struct list_head mmap_file_stat_hot_head;
+	//0个file_area的file_stat移动到这个链表，暂时没用到
+	struct list_head mmap_file_stat_zero_file_area_head;
+	//inode被删除的文件的file_stat移动到这个链表，暂时不需要
+	struct list_head mmap_file_stat_delete_head;
+    
+
 	//mmap文件用的全局锁
 	spinlock_t mmap_file_global_lock;
 
@@ -2887,11 +2891,11 @@ out:
 static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup_and_create(struct hot_cold_file_area_tree_root *root,
 		unsigned long area_index,void ***page_slot_in_tree)
 {
-	unsigned int shift, offset = 0;
+	unsigned int /*shift,*/ offset = 0;
 	unsigned long max_area_index;
 	struct hot_cold_file_area_tree_node *node = NULL, *child;
 	void **slot = (void **)&root->root_node;
-	int ret;
+	int ret,shift;
 	
 	//file_area_tree根节点，radix tree原本用的是rcu_dereference_raw，为什么?????????????需要研究下
 	node = rcu_dereference_raw(root->root_node);
@@ -2962,6 +2966,9 @@ static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup_and_c
 		slot = &node->slots[offset];
 		//下轮循环，node= child 成为新的父节点。slot指向父节点node的某个槽位，这个槽位保存child这个节点指针 或者file_area_tree树最下层节点的file_area_tree指针
 	}
+	if(shift < 0)
+	    panic("%s shift:%d error\n",__func__,shift);
+
 	//page_slot_in_tree是3重指针，*page_slot_in_tree 和 slot 是2重指针，*page_slot_in_tree和slot才能彼此赋值。赋值后*page_slot_in_tree保存的是槽位的地址
 	*page_slot_in_tree = slot;
 	return node;
@@ -2972,10 +2979,11 @@ static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup_and_c
 static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup(struct hot_cold_file_area_tree_root *root,
 		unsigned long area_index,void ***page_slot_in_tree)
 {
-	unsigned int /*shift, */offset = 0;
+	unsigned int /*shift,*/ offset = 0;
 	unsigned long max_area_index;
 	struct hot_cold_file_area_tree_node *node = NULL, *child;
 	void **slot = (void **)&root->root_node;
+	int shift;
 
 	//file_area_tree根节点，radix tree原本用的是rcu_dereference_raw，为什么?????????????需要研究下
 	node = rcu_dereference_raw(root->root_node);
@@ -2984,6 +2992,8 @@ static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup(struc
 		/*此时的根节点node指针的bit0是1，表示是个节点，并不是真正的hot_cold_file_area_tree_node指针，此时node->shift永远错误是0。下边每次
 		 *就有很大概率执行hot_cold_file_area_tree_extend()反复创建tree新的层数，即便对应的层数之前已经创建过了*/
 		node = entry_to_node(node);
+        //file_area_tree根节点的的shift+6
+		shift = node->shift + TREE_MAP_SHIFT;
 		max_area_index = hot_cold_file_area_tree_shift_maxindex(node->shift);
 		/*这里要把node的bit0置1，否则下边child = node后，child的bit0是0，不再表示根节点，导致下边的while循环中直接走
 		 *else if (!hot_cold_file_area_tree_is_internal_node(child))分支,这样每次都无法遍历tree，返回的*/
@@ -2992,6 +3002,7 @@ static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup(struc
 	else//到这里说明file_area_tree 是空的，没有根节点
 	{
 		max_area_index = 0;
+		shift = 0;
 	}
 	//此时child指向根节点
 	child = node;
@@ -3005,8 +3016,8 @@ static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup(struc
 	}
 
 	//node是父节点，slot指向父节点node的某个槽位，这个槽位保存child这个节点指针 或者file_area_tree树最下层节点的file_area_tree指针
-	while (hot_cold_file_area_tree_is_internal_node(child)) {
-
+	while (hot_cold_file_area_tree_is_internal_node(child) && (shift > 0)) {
+        shift -= TREE_MAP_SHIFT;
 		node = entry_to_node(child);
 		//根据area_index索引计算在父节点的槽位索引offset
 		offset = (area_index >> node->shift) & TREE_MAP_MASK;
@@ -3016,6 +3027,19 @@ static struct hot_cold_file_area_tree_node *hot_cold_file_area_tree_lookup(struc
 		slot = &node->slots[offset];
 		//下轮循环，node= child 成为新的父节点。slot指向父节点node的某个槽位，这个槽位保存child这个节点指针 或者file_area_tree树最下层节点的file_area_tree指针
 	}
+
+	/*如果shift不是0，直接返回NULL，为什么？这是个隐藏很深的bug，在头特定场景下会出大问题。举例，现在radix tree树两层，最多能容纳64*64=4096个成员。
+	 *现在根节点只有node.slot[0]和node.slot[1]两个成员，目前只保存了索引是0~127的这128个file_area。现在查找索引是128的file_area，根节点node.slot[2]
+	 *是NULL，上边的while循环里，child = rcu_dereference_raw(node->slots[offset])=根节点node.slot[2]=NULL。然后立即while退出循环。shift初值
+	 *根节点shift+6=12。因此到这里时shift是6。这种情况下，就说明在查找file_area时，因为它的父节点是NULL(即根节点node[2]是NULL)导致中途结束。
+     *此时应该返回NULL，表示待查找的file_area是NULL。否则是"return node"返回的根节点，并且因为"*page_slot_in_tree = slot"，page_slot_in_tree
+	 *指向的file_area的父节点在根节点的槽位地址。这就导致mmap文件页回收reverse_file_stat_radix_tree_hole()函数中，遍历radix tree创建空洞
+	 *file_area时，出现lookup的父节点和槽位地址出现错乱的的重大bug*/
+	if(0 != shift){
+        return NULL;
+	}
+	else if(shift < 0)
+	    panic("%s shift:%d error\n",__func__,shift);
 	/*page_slot_in_tree是3重指针，*page_slot_in_tree 和 slot 是2重指针，*page_slot_in_tree和slot才能彼此赋值。赋值后*page_slot_in_tree保存的是槽位的地址.
 	 *到这里只有两种情况，1：找到area_index索引对应的file_area，*page_slot_in_tree指向这个file_area在radix tree的槽位。2：没有找到，则*page_slot_in_tree = slot
 	 *赋值后，*page_slot_in_tree指向的槽位里的数据是NULL，这是肯定的*/
@@ -5274,6 +5298,8 @@ static int hot_cold_file_init(void)
 	INIT_LIST_HEAD(&hot_cold_file_global_info.mmap_file_stat_delete_head);
 	INIT_LIST_HEAD(&hot_cold_file_global_info.mmap_file_stat_temp_large_file_head);
 	INIT_LIST_HEAD(&hot_cold_file_global_info.mmap_file_stat_hot_head);
+	INIT_LIST_HEAD(&hot_cold_file_global_info.mmap_file_stat_uninit_head);
+	INIT_LIST_HEAD(&hot_cold_file_global_info.mmap_file_stat_temp_large_file_head);
 
 	spin_lock_init(&hot_cold_file_global_info.global_lock);
 	spin_lock_init(&hot_cold_file_global_info.mmap_file_global_lock);
@@ -5507,7 +5533,7 @@ file_stat_delete:
 //发生refault的file_area经过FILE_AREA_REFAULT_TO_TEMP_AGE_DX个周期后，还没有被访问，则移动到file_area_temp链表
 #define MMAP_FILE_AREA_REFAULT_TO_TEMP_AGE_DX 30
 //普通的file_area在FILE_AREA_TEMP_TO_COLD_AGE_DX个周期内没有被访问则被判定是冷file_area，然后释放这个file_area的page
-#define MMAP_FILE_AREA_TEMP_TO_COLD_AGE_DX  20
+#define MMAP_FILE_AREA_TEMP_TO_COLD_AGE_DX  20//这个参数调的很小容易在file_area被内存回收后立即释放，这样测试了很多bug，先不要改
 
 static struct kprobe kp__xfs_file_mmap = {
 	.symbol_name    = "xfs_file_mmap",
@@ -5829,6 +5855,7 @@ static int reverse_file_area_refault_and_free_list(struct hot_cold_file_global *
 				        *file_area_last = p_file_area_temp;
 						delete_file_area_last = 1;
 				    }
+                    clear_file_area_in_free_list(p_file_area);
 					cold_file_area_detele_quick(p_hot_cold_file_global,p_file_stat,p_file_area);
 				}
 			}else{
@@ -6112,6 +6139,7 @@ static int check_page_exist_and_create_file_area(struct hot_cold_file_global *p_
 				goto out;
 			}
 
+			ret = 1;
             //令_page_slot_in_tree指向新分配的file_area在radix tree的parent_node.slots[槽位索引]槽位地址
 			if(NULL == *_page_slot_in_tree)
                 *_page_slot_in_tree = page_slot_in_tree;
@@ -6133,10 +6161,11 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 	int i,j;
     struct hot_cold_file_area_tree_node *parent_node;
 	void **page_slot_in_tree = NULL;
-	unsigned int area_index_for_page;
+	unsigned int base_area_index;
     int ret = 0;
 	unsigned int file_page_count = p_file_stat->mapping->host->i_size >> PAGE_SHIFT;//除以4096
 	unsigned int start_page_index = 0;
+    struct file_area *p_file_area;
 
 	//p_file_stat->traverse_done是0，说明还没有遍历完一次文件的page，那先返回
 	if(0 == p_file_stat->traverse_done)
@@ -6145,13 +6174,13 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 	printk("1:%s file_stat:0x%llx file_stat->last_index:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index);
 
 	//p_file_stat->last_index初值是0，后续依次是64*1、64*2、64*3等等，
-	area_index_for_page = p_file_stat->last_index;
-
+	base_area_index = p_file_stat->last_index;
+    j = 0;
     //一次遍历SCAN_FILE_AREA_NODE_COUNT个node，一个node 64个file_area
 	for(i = 0;i < SCAN_FILE_AREA_NODE_COUNT;i++){
 		//每次必须对page_slot_in_tree赋值NULL，下边hot_cold_file_area_tree_lookup()如果没找到对应索引的file_area，page_slot_in_tree还是NULL
 		page_slot_in_tree = NULL;
-
+        j = 0;
 		/*查找索引0、64*1、64*2、64*3等等的file_area的地址，保存到page_slot_in_tree。page_slot_in_tree指向的是每个node节点的第一个file_area，
 		 *每个node节点一共64个file_area，都保存在node节点的slots[64]数组。下边的for循环一次查找node->slots[0]~node->slots[63]，如果是NULL，
 		 *说明还没有分配file_area，是空洞，那就分配file_area并添加到radix tree。否则说明file_area已经分配了，就不用再管了*/
@@ -6159,19 +6188,19 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 		/*不能用hot_cold_file_area_tree_lookup_and_create，如果是空树，但是去探测索引是1的file_area，此时会直接分配索引是1的file_area对应的node节点
 		 *并插入radix tree，注意是分配node节点。而根本不管索引是1的file_area对应的文件页page是否分配了。这样会分配很多没用的node节点，而不管对应索引的
 		 *file_area的文件页是否分配了，浪费内存。这里只能探测file_area是否存在，不能node节点*/
-		//parent_node = hot_cold_file_area_tree_lookup_and_create(&p_file_stat->hot_cold_file_area_tree_root_node,area_index_for_page,&page_slot_in_tree);
+		//parent_node = hot_cold_file_area_tree_lookup_and_create(&p_file_stat->hot_cold_file_area_tree_root_node,base_area_index,&page_slot_in_tree);
 
 		/*空树时函数返回NULL并且page_slot_in_tree指向root->root_node的地址。当传入索引很大找不到file_area时，函数返回NULL并且page_slot_in_tree不会被赋值(保持原值NULL)*/
-		parent_node = hot_cold_file_area_tree_lookup(&p_file_stat->hot_cold_file_area_tree_root_node,area_index_for_page,&page_slot_in_tree);
+		parent_node = hot_cold_file_area_tree_lookup(&p_file_stat->hot_cold_file_area_tree_root_node,base_area_index,&page_slot_in_tree);
 		if(IS_ERR(parent_node)){
 			ret = -1;
 			printk("2:%s hot_cold_file_area_tree_lookup_and_create fail\n",__func__);
 			goto out;
 		}
         /*一个node FILE_AREA_PER_NODE(64)个file_area。下边靠着page_slot_in_tree++依次遍历这64个file_area，如果*page_slot_in_tree
-		 *是NULL，说明是空洞file_area，之前这个file_area对应的page没有分配，也没有分配file_area，于是按照area_index_for_page<<PAGE_COUNT_IN_AREA_SHIFT
+		 *是NULL，说明是空洞file_area，之前这个file_area对应的page没有分配，也没有分配file_area，于是按照base_area_index<<PAGE_COUNT_IN_AREA_SHIFT
 		 *这个page索引，在此查找page是否分配了，是的话就分配file_area*/
-		for(j = 0;j < FILE_AREA_PER_NODE - 1;){
+		while(1){
 			/* 1：hot_cold_file_area_tree_lookup中找到对应索引的file_area，parent_node非NULL，page_slot_in_tree和*page_slot_in_tree都非NULL
 			 * 2：hot_cold_file_area_tree_lookup中没找到对应索引的file_area，但是父节点存在，parent_node非NULL，page_slot_in_tree非NULL，*page_slot_in_tree是NULL
 			 * 3：hot_cold_file_area_tree_lookup中没找到对应索引的file_area，父节点也不存在，parent_node是NULL，page_slot_in_tree是NULL，此时不能出现*page_slot_in_tree
@@ -6184,16 +6213,16 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 			 * 情况2：待查找的file_area的索引太大，没找到父节点，parent_node是NULL，page_slot_in_tree也是NULL，此时不能用*page_slot_in_tree，会crash
 			 * 情况3：radix tree是空树，lookup索引是0的file_area后， parent_node是NULL，page_slot_in_tree非NULL，指向p_file_stat->hot_cold_file_area_tree_root_node->root_node的地址
 			 * */
-
-			start_page_index = area_index_for_page << PAGE_COUNT_IN_AREA_SHIFT;
-            if(start_page_index > file_page_count){
-			    printk("3:%s start_page_index:%d > file_page_count:%d\n",__func__,start_page_index,file_page_count);
+        
+			start_page_index = (base_area_index + j) << PAGE_COUNT_IN_AREA_SHIFT;
+            if(start_page_index >= file_page_count){
+			    printk("3:%s start_page_index:%d >= file_page_count:%d\n",__func__,start_page_index,file_page_count);
 			    goto out;
 		    }
 			if(page_slot_in_tree)
-	            printk("4:%s file_stat:0x%llx i:%d j:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
+	            printk("4:%s file_stat:0x%llx i:%d j:%d start_page_index:%d base_area_index:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,start_page_index,base_area_index,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
 			else
-	            printk("4:%s file_stat:0x%llx i:%d j:%d parent_node:0x%llx page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)parent_node,(u64)page_slot_in_tree);
+	            printk("4:%s file_stat:0x%llx i:%d j:%d start_page_index:%d base_area_index:%d parent_node:0x%llx page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,start_page_index,base_area_index,(u64)parent_node,(u64)page_slot_in_tree);
            
 			/* (NULL == page_slot_in_tree)：对应情况2，radix tree现在节点太少，待查找的file_area索引太大找不到父节点和file_area的槽位，
 			 * parent_node 和 page_slot_in_tree都是NULL。那就执行check_page_exist_and_create_file_area()分配父节点 parent_node，并令page_slot_in_tree指向
@@ -6207,22 +6236,32 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 			 *
 			 * */
 			if((NULL == page_slot_in_tree)  || (NULL!= page_slot_in_tree && NULL == *page_slot_in_tree)){
-			    if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page + j) < 0){
+				ret = check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,base_area_index + j);
+			    if(ret < 0){
 			        printk("5:%sheck_page_exist_and_create_file_area fail\n",__func__);
-					ret = -1;
 			        goto out;
-                }
+                }else if(ret >0){
+					//ret 大于0说明上边创建了file_area或者node节点，这里再打印出来
+	                printk("6:%s file_stat:0x%llx i:%d j:%d start_page_index:%d base_area_index:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,start_page_index,base_area_index,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
+				}
 			}
-			if(page_slot_in_tree)
-	            printk("6:%s file_stat:0x%llx i:%d j:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
-			else
-	            printk("6:%s file_stat:0x%llx i:%d j:%d parent_node:0x%llx page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,(u64)parent_node,(u64)page_slot_in_tree);
+
+			if(page_slot_in_tree){
+                barrier();
+				if(*page_slot_in_tree){
+                    p_file_area = (struct file_area *)(*page_slot_in_tree);
+					//file_area自身保存的索引数据 跟所在radix tree的槽位位置不一致，触发crash
+					if((p_file_area->start_index >>PAGE_COUNT_IN_AREA_SHIFT) != base_area_index + j)
+					    panic("%s file_area index error!!!!!! file_stat:0x%llx p_file_area:0x%llx p_file_area->start_index:%ld base_area_index:%d j:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->start_index,base_area_index,j);
+
+				}
+			}
 /*
 			//情况1：只要待查找索引的file_area的父节点存在，parent_node不是NULL，page_slot_in_tree也一定不是NULL
 			if(parent_node){
 				//待查找索引的file_area不存在，则探测它对应的page是否存在，存在的话则分配file_area
                 if(NULL == *page_slot_in_tree){
-					if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page + j) < 0){
+					if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,base_area_index + j) < 0){
 					    goto out;
 					}
 				}
@@ -6233,30 +6272,34 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 			{
 				//情况2：待查找的file_area的索引太大，没找到父节点，parent_node是NULL，page_slot_in_tree也是NULL，此时不能用*page_slot_in_tree，会crash
 				if(NULL == page_slot_in_tree){
-					if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page+j) < 0){
+					if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,base_area_index+j) < 0){
 					    goto out;
 					}
 					//到这里，如果指定索引的file_area的page存在，则创建父节点和file_area，parent_node和page_slot_in_tree不再是NULL，*ppage_slot_in_tree也非NULL
 				}
 				//情况3：radix tree是空树，lookup索引是0的file_area后， parent_node是NULL，page_slot_in_tree非NULL，指向*p_file_stat->hot_cold_file_area_tree_root_node->root_node的地址
 			    else{
-			        if((0 == j) && (0 == area_index_for_page)&& (page_slot_in_tree ==  &p_file_stat->hot_cold_file_area_tree_root_node.root_node)){
+			        if((0 == j) && (0 == base_area_index)&& (page_slot_in_tree ==  &p_file_stat->hot_cold_file_area_tree_root_node.root_node)){
 						//如果索引是0的file_area不存在，则探测对应page是否存在，存在的话创建索引是0的file_area，不用创建父节点，file_area指针保存在p_file_stat->hot_cold_file_area_tree_root_node->root_node
 						if(NULL == *page_slot_in_tree){
-					        if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page + j) < 0){
+					        if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,base_area_index + j) < 0){
 					            goto out;
 					        }
 						}
 					}else{
-					    if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,area_index_for_page + j) < 0){
+					    if(check_page_exist_and_create_file_area(p_hot_cold_file_global,p_file_stat,&parent_node,&page_slot_in_tree,base_area_index + j) < 0){
 					        goto out;
 					    }
 						//这里可能进入，空树时，探测索引很大的file_area
-					    printk("%s j:%d area_index_for_page:%d page_slot_in_tree:0x%llx_0x%llx error!!!!!!!!!\n",__func__,j,area_index_for_page,(u64)page_slot_in_tree,(u64)&p_file_stat->hot_cold_file_area_tree_root_node.root_node);
+					    printk("%s j:%d base_area_index:%d page_slot_in_tree:0x%llx_0x%llx error!!!!!!!!!\n",__func__,j,base_area_index,(u64)page_slot_in_tree,(u64)&p_file_stat->hot_cold_file_area_tree_root_node.root_node);
 					}
 				}
 			}
 */			
+			//依次只能遍历FILE_AREA_PER_NODE 个file_area
+			if(j >= FILE_AREA_PER_NODE - 1)
+			    break;
+
 			//j加1令page_slot_in_tree指向下一个file_area
 			j++;
 			if(parent_node){
@@ -6267,16 +6310,19 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 					panic("%s page_slot_in_tree:0x%llx error 0x%llx_0x%llx\n",__func__,(u64)page_slot_in_tree,(u64)(&parent_node->slots[0]),(u64)(&parent_node->slots[TREE_MAP_SIZE]));
 				}
 		   #endif
+			}else{
+				/*到这里，应该radix tree是空树时才成立，要令page_slot_in_tree指向NULL，否则当前这个for循环的page_slot_in_tree值会被错误用到下个循环*/
+			    page_slot_in_tree = NULL;
 			}
         }
-		//area_index_for_page的取值，0，后续依次是64*1、64*2、64*3等等，
-		area_index_for_page += FILE_AREA_PER_NODE;
+		//base_area_index的取值，0，后续依次是64*1、64*2、64*3等等，
+		base_area_index += FILE_AREA_PER_NODE;
     }
 	//p_file_stat->last_index记录下次要查找的第一个node节点的file_area的索引
-	p_file_stat->last_index = area_index_for_page;
+	p_file_stat->last_index = base_area_index;
 out:
-    if((0 == ret) && (area_index_for_page << PAGE_COUNT_IN_AREA_SHIFT > file_page_count)){
-	    printk("7:%s last_index = 0 last_index:%d area_index_for_page:%d file_page_count:%d\n",__func__,p_file_stat->last_index,area_index_for_page << PAGE_COUNT_IN_AREA_SHIFT,file_page_count);
+    if((ret >= 0) && ((base_area_index +j) << PAGE_COUNT_IN_AREA_SHIFT >= file_page_count)){
+	    printk("7:%s last_index = 0 last_index:%d base_area_index:%d j:%d file_page_count:%d\n",__func__,p_file_stat->last_index,base_area_index,j,file_page_count);
 	    //p_file_stat->last_index清0，下次从头开始扫描文件页
 	    p_file_stat->last_index = 0;
 	}
