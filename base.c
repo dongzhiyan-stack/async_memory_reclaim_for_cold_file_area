@@ -2084,7 +2084,7 @@ unsed_inode:
 			 参与正常的异步内存回收。但是这个过程需要加锁，因为file_stat设置了in temp list状态*/
 			spin_lock(&p_hot_cold_file_global->global_lock);
 			clear_file_stat_in_drop_cache(p_file_stat);
-            //设置file_stat in_temp_list最好放到把file_stat添加到global temp链表操作前，原因在add_mmap_file_stat_to_list()有分析
+			//设置file_stat in_temp_list最好放到把file_stat添加到global temp链表操作前，原因在add_mmap_file_stat_to_list()有分析
 			set_file_stat_in_file_stat_temp_head_list(p_file_stat);
 			smp_wmb();
 			list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->file_stat_temp_head);
@@ -2168,7 +2168,7 @@ static inline int  add_file_to_file_stat(struct address_space *mapping)
 		hot_cold_file_global_info.file_stat_count ++;
 
 		memset(p_file_stat,0,sizeof(struct file_stat));
-        //设置文件是cache文件状态，有些cache文件可能还会被mmap映射，要与mmap文件互斥，要么是cache文件要么是mmap文件，不能两者都是 
+		//设置文件是cache文件状态，有些cache文件可能还会被mmap映射，要与mmap文件互斥，要么是cache文件要么是mmap文件，不能两者都是 
 		set_file_stat_in_cache_file(p_file_stat);
 		//初始化file_area_hot头结点
 		INIT_LIST_HEAD(&p_file_stat->file_area_hot);
@@ -2177,7 +2177,7 @@ static inline int  add_file_to_file_stat(struct address_space *mapping)
 		INIT_LIST_HEAD(&p_file_stat->file_area_free_temp);
 		INIT_LIST_HEAD(&p_file_stat->file_area_free);
 		INIT_LIST_HEAD(&p_file_stat->file_area_refault);
-	    INIT_LIST_HEAD(&p_file_stat->file_area_mapcount);
+		INIT_LIST_HEAD(&p_file_stat->file_area_mapcount);
 
 		mapping->rh_reserved1 = (unsigned long)p_file_stat;
 		p_file_stat->mapping = mapping;
