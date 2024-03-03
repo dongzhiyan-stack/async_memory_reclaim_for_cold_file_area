@@ -196,7 +196,11 @@ struct hot_cold_file_shrink_counter
 	unsigned int find_file_area_from_last_count;
 
 	//每个周期频繁冗余lru_lock的次数
-	unsigned int lru_lock_count;
+	//unsigned int lru_lock_count;
+	//释放的mmap page个数
+	unsigned int mmap_free_pages_count;
+	unsigned int mmap_writeback_count;
+	unsigned int mmap_dirty_count;
 };
 //一个file_area表示了一片page范围(默认6个page)的冷热情况，比如page索引是0~5、6~11、12~17各用一个file_area来表示
 struct file_area
@@ -420,6 +424,9 @@ struct hot_cold_file_global
 	struct list_head mmap_file_stat_zero_file_area_head;
 	//inode被删除的文件的file_stat移动到这个链表，暂时不需要
 	struct list_head mmap_file_stat_delete_head;
+	//每个周期频繁冗余lru_lock的次数
+	unsigned int lru_lock_count;
+	unsigned int mmap_file_lru_lock_count;
 
 
 	//mmap文件用的全局锁
@@ -718,6 +725,21 @@ static inline void unlock_file_stat(struct file_stat * p_file_stat){
 	test_and_clear_bit(F_file_stat_lock_not_block,&p_file_stat->file_stat_status);
 	clear_bit_unlock(F_file_stat_lock, &p_file_stat->file_stat_status);
 }
+/*根据p_file_area对应的起始文件页page索引从文件mapping radix tree一次性得到PAGE_COUNT_IN_AREA个page，这个遍历一次radix tree
+ *就能得到PAGE_COUNT_IN_AREA个page*/
+static inline int get_page_from_file_area(struct file_stat *p_file_stat,pgoff_t file_area_start_page_index,struct page **pages)
+{
+	struct address_space *mapping = p_file_stat->mapping;
+	int i,ret;
+	ret = find_get_pages_contig(mapping,file_area_start_page_index,PAGE_COUNT_IN_AREA,pages);
+	for(i = 0;i < ret;i++){
+		put_page(pages[i]);//上边会令page引用计数加1，这里只能再减1，先强制减1了，后期需要优化find_get_pages_contig()函数
+	}
+	return ret;
+}
+
+//使用内核原生的shrink_inactive_list()函数进行内存回收
+#define USE_KERNEL_SHRINK_INACTIVE_LIST
 
 extern struct hot_cold_file_global hot_cold_file_global_info;
 //置1会把内存回收信息详细打印出来
@@ -736,6 +758,12 @@ extern void file_stat_free_leak_page(struct hot_cold_file_global *p_hot_cold_fil
 extern int drop_cache_truncate_inode_pages(struct hot_cold_file_global *p_hot_cold_file_global);
 extern int hot_cold_file_proc_init(struct hot_cold_file_global *p_hot_cold_file_global);
 extern int hot_cold_file_proc_exit(struct hot_cold_file_global *p_hot_cold_file_global);
+extern unsigned long cold_file_isolate_lru_pages_and_shrink(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat,struct list_head *file_area_free);
+#ifdef USE_KERNEL_SHRINK_INACTIVE_LIST
+extern unsigned int cold_mmap_file_isolate_lru_pages_and_shrink(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat,struct file_area *p_file_area,struct page *page_buf[],int cold_page_count);
+#else
+extern unsigned int cold_mmap_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat,struct file_area *p_file_area,struct page *page_buf[],int cold_page_count);
+#endif
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)
 extern void (*free_unref_page_list_async)(struct list_head *list);

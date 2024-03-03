@@ -32,8 +32,9 @@ static int hot_cold_file_init(void);
 static int inline cold_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del);
 static int  cold_mmap_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del);
 static int walk_throuth_all_mmap_file_area(struct hot_cold_file_global *p_hot_cold_file_global);
+#ifndef USE_KERNEL_SHRINK_INACTIVE_LIST
 static int  solve_reclaim_fail_page(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat *p_file_stat,struct list_head *page_list);
-
+#endif
 /*************以下代码不同内核版本保持一致******************************************************************************************/
 static inline unsigned long hot_cold_file_area_tree_shift_maxindex(unsigned int shift)
 {
@@ -1233,6 +1234,7 @@ out:
 }
 EXPORT_SYMBOL(hot_file_update_file_status);
 
+#ifndef USE_KERNEL_SHRINK_INACTIVE_LIST
 static unsigned long cold_file_shrink_pages(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat *p_file_stat,bool is_mmap_file)
 {
 	int i;
@@ -1286,6 +1288,8 @@ static unsigned long cold_file_shrink_pages(struct hot_cold_file_global *p_hot_c
 	}
 	return nr_reclaimed;
 }
+#endif
+
 /*遍历hot_cold_file_global->file_stat_temp_large_file_head或file_stat_temp_head链表尾巴上边的文件file_stat，然后遍历这些file_stat的
  *file_stat->file_area_temp链表尾巴上的file_area，被判定是冷的file_area则移动到file_stat->file_area_free_temp链表。把有冷file_area的
   file_stat移动到file_stat_free_list临时链表。返回值是遍历到的冷file_area个数*/
@@ -1618,14 +1622,18 @@ static unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot
 	//遍历file_stat_free_list临时链表上的file_stat，释放这些file_stat的file_stat->file_area_free_temp链表上的冷file_area的page
 	list_for_each_entry(p_file_stat,file_stat_free_list,hot_cold_file_list)
 	{
+#ifdef USE_KERNEL_SHRINK_INACTIVE_LIST
+		isolate_lru_pages += cold_file_isolate_lru_pages_and_shrink(p_hot_cold_file_global,p_file_stat,&p_file_stat->file_area_free_temp);
+		free_pages += p_hot_cold_file_global->hot_cold_file_shrink_counter.free_pages_count;
+#else		
 		/*对file_area_free_temp上的file_stat上的file_area对应的page进行隔离，隔离成功的移动到
 		 *p_hot_cold_file_global->hot_cold_file_node_pgdat->pgdat_page_list对应内存节点链表上*/
 		isolate_lru_pages += cold_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,&p_file_stat->file_area_free_temp);
 		//这里真正释放p_hot_cold_file_global->hot_cold_file_node_pgdat->pgdat_page_list链表上的内存page
 		free_pages += cold_file_shrink_pages(p_hot_cold_file_global,p_file_stat,0);
+#endif
 
-
-		if(shrink_page_printk_open1)
+		//if(shrink_page_printk_open1)
 			printk("1:%s %s %d p_hot_cold_file_global:0x%llx p_file_stat:0x%llx status:0x%lx free_pages:%d\n",__func__,current->comm,current->pid,(u64)p_hot_cold_file_global,(u64)p_file_stat,p_file_stat->file_stat_status,free_pages);
 
 		/*注意，file_stat->file_area_free_temp 和 file_stat->file_area_free 各有用处。file_area_free_temp保存每次扫描释放的page的file_area。
@@ -2653,7 +2661,7 @@ static int inline is_mmap_file_stat_mapcount_file(struct hot_cold_file_global *p
 	}
 	return ret;
 }
-
+#ifndef USE_KERNEL_SHRINK_INACTIVE_LIST
 //mmap的文件页page，内存回收失败，测试发现都是被访问页表pte置位了，则把这些page移动到file_stat->refault链表
 static int  solve_reclaim_fail_page(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat *p_file_stat,struct list_head *page_list)
 {
@@ -2715,6 +2723,7 @@ static int  solve_reclaim_fail_page(struct hot_cold_file_global *p_hot_cold_file
 	}
 	return 0;
 }
+#endif
 static int  cold_mmap_file_stat_delete(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat_del)
 {  
 
@@ -2730,18 +2739,6 @@ static int  cold_mmap_file_stat_delete(struct hot_cold_file_global *p_hot_cold_f
 	//spin_unlock(&p_hot_cold_file_global->mmap_file_global_lock);
 
 	return 0;
-}
-/*根据p_file_area对应的起始文件页page索引从文件mapping radix tree一次性得到PAGE_COUNT_IN_AREA个page，这个遍历一次radix tree
- *就能得到PAGE_COUNT_IN_AREA个page*/
-static int get_page_from_file_area(struct file_stat *p_file_stat,pgoff_t file_area_start_page_index,struct page **pages)
-{
-	struct address_space *mapping = p_file_stat->mapping;
-	int i,ret;
-	ret = find_get_pages_contig(mapping,file_area_start_page_index,PAGE_COUNT_IN_AREA,pages);
-	for(i = 0;i < ret;i++){
-		put_page(pages[i]);//上边会令page引用计数加1，这里只能再减1，先强制减1了，后期需要优化find_get_pages_contig()函数
-	}
-	return ret;
 }
 /*对文件inode加锁，如果inode已经处于释放状态则返回0，此时不能再遍历该文件的inode的address_space的radix tree获取page，释放page，
  *此时inode已经要释放了，inode、address_space、radix tree都是无效内存。否则，令inode引用计数加1，然后其他进程就无法再释放这个
@@ -2785,136 +2782,6 @@ static void inline file_inode_unlock(struct file_stat * p_file_stat)
 	iput(inode);
 }
 
-static unsigned int cold_mmap_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat,struct file_area *p_file_area,struct page *page_buf[],int cold_page_count)
-{
-	unsigned int isolate_pages = 0;
-	int i,traverse_page_count;
-	struct page *page;
-	struct list_head *dst;
-	//isolate_mode_t mode = ISOLATE_UNMAPPED;
-	isolate_mode_t mode = 0;
-	pg_data_t *pgdat = NULL;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
-	struct lruvec *lruvec = NULL,*lruvec_new = NULL;
-#endif
-
-	printk("1:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
-	traverse_page_count = 0;
-	//对file_stat加锁
-	lock_file_stat(p_file_stat,0);
-	//如果文件inode和mapping已经释放了，则不能再使用mapping了，必须直接return
-	if(file_stat_in_delete(p_file_stat) || (NULL == p_file_stat->mapping)){
-		printk("2:%s file_stat:0x%llx %d_0x%llx\n",__func__,(u64)p_file_stat,file_stat_in_delete(p_file_stat),(u64)p_file_stat->mapping);
-		//如果异常退出，也要对page unlock
-		for(i = 0; i< cold_page_count;i ++)
-		{
-			page = page_buf[i];
-			if(page)
-				unlock_page(page);
-			else
-				panic("%s page error\n",__func__);
-		}
-		goto err;
-	}
-	/*read/write系统调用的pagecache的内存回收执行的cold_file_isolate_lru_pages()函数里里，对此时并发文件inode被delete做了严格防护，这里
-	 * 对mamp的pagecache是否也需要防护并发inode被delete呢？突然觉得没有必要呀？因为文件还有文件页page没有被释放呀，就是这里正在回收的
-	 * 文件页！这种情况文件inode可能会被delete吗？不会吧，必须得等文件的文件页全部被回收，才可能释放文件inode吧??????????????????*/
-	for(i = 0; i< cold_page_count;i ++)
-	{
-		page = page_buf[i];
-		printk("3:%s file_stat:0x%llx file_area:0x%llx page:0x%llx\n",__func__,(u64)p_file_stat,(u64)p_file_area,(u64)page);
-		//此时page肯定是加锁状态，否则就主动触发crash
-		if(!test_bit(PG_locked,&page->flags)){
-			panic("%s page:0x%llx page->flags:0x%lx\n",__func__,(u64)page,page->flags);
-		}
-
-		if(traverse_page_count++ >= 32){
-			traverse_page_count = 0;
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)	
-			//使用pgdat->lru_lock锁，且有进程阻塞在这把锁上则强制休眠。还有，如果lru_lock持锁时间过长，也需要调度，否则会发生softlockups
-			if(pgdat && (spin_is_contended(&pgdat->lru_lock) || need_resched())){
-				spin_unlock_irq(&pgdat->lru_lock); 
-				if(need_resched())
-					schedule();
-				else
-					msleep(5);//其实这里改成schedule()也可以!!!!!!!!!!!!!
-
-				spin_lock_irq(&pgdat->lru_lock);
-				//p_hot_cold_file_global->hot_cold_file_shrink_counter.lru_lock_contended_count ++;
-			}
-#else
-			//使用 lruvec->lru_lock 锁，且有进程阻塞在这把锁上
-			if(lruvec && (spin_is_contended(&lruvec->lru_lock) || need_resched())){
-				spin_unlock_irq(&lruvec->lru_lock); 
-				if(need_resched())
-					schedule();
-				else
-					msleep(5);
-
-				spin_lock_irq(&lruvec->lru_lock);
-				//p_hot_cold_file_global->hot_cold_file_shrink_counter.lru_lock_contended_count ++;
-			}
-#endif
-		}
-
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)	
-		if(unlikely(pgdat != page_pgdat(page)))
-		{
-			//第一次进入这个if，pgdat是NULL，此时不用spin unlock，只有后续的page才需要
-			if(pgdat){
-				//对之前page所属pgdat进行spin unlock
-				spin_unlock_irq(&pgdat->lru_lock);
-				//多次开关锁次数加1
-				p_hot_cold_file_global->hot_cold_file_shrink_counter.lru_lock_count++;
-			}
-			//pgdat最新的page所属node节点对应的pgdat
-			pgdat = page_pgdat(page);
-			if(pgdat != p_hot_cold_file_global->p_hot_cold_file_node_pgdat[pgdat->node_id].pgdat)
-				panic("pgdat not equal\n");
-			//对新的page所属的pgdat进行spin lock。内核遍历lru链表都是关闭中断的，这里也关闭中断
-			spin_lock_irq(&pgdat->lru_lock);
-		}
-#else
-		//为了保持兼容，还是把每个内存节点的page都移动到对应hot_cold_file_global->p_hot_cold_file_node_pgdat[pgdat->node_id].pgdat_page_list_mmap_file链表上
-		if(pgdat != page_pgdat(page))
-			pgdat = page_pgdat(page);
-
-		lruvec_new = mem_cgroup_lruvec_async(page_memcg(page),pgdat);
-		if(unlikely(lruvec != lruvec_new)){
-			if(lruvec){
-				spin_unlock_irq(&lruvec->lru_lock);
-				//多次开关锁次数加1
-				p_hot_cold_file_global->hot_cold_file_shrink_counter.lru_lock_count++;
-			}
-			lruvec = lruvec_new;
-			//对新的page所属的pgdat进行spin lock
-			spin_lock_irq(&lruvec->lru_lock);
-		}
-#endif
-
-		//解锁。其实也可以不用解锁，这样async_shrink_free_page()函数回收内存时，就不用再加锁lock_page了，后期再考虑优化吧?????????????????
-		unlock_page(page);
-
-		dst = &p_hot_cold_file_global->p_hot_cold_file_node_pgdat[pgdat->node_id].pgdat_page_list_mmap_file;
-		if(__hot_cold_file_isolate_lru_pages(pgdat,page,dst,mode) != 0){
-			//goto err; 到这里说明page busy，不能直接goto err返回错误，继续遍历page，否则就中断了整个内存回收流程，完全没必要
-			continue;
-		}
-		isolate_pages ++;
-	}
-err:
-	//file_stat解锁
-	unlock_file_stat(p_file_stat);
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,18,0)	
-	if(pgdat)
-		spin_unlock_irq(&pgdat->lru_lock);
-#else
-	if(lruvec)
-		spin_unlock_irq(&lruvec->lru_lock);
-#endif
-
-	return isolate_pages;
-}
 static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat,struct file_area *p_file_area,struct page *page_buf[],int *cold_page_count)
 {
 	unsigned long vm_flags;
@@ -4099,12 +3966,17 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 		 *2:page_buf剩余的空间不足容纳PAGE_COUNT_IN_AREA个page，if也成立，否则下个循环执行check_one_file_area_cold_page_and_clear函数
 		 *向page_buf保存PAGE_COUNT_IN_AREA个page，将导致内存溢出*/
 		if(cold_page_count >= BUF_PAGE_COUNT || (BUF_PAGE_COUNT - cold_page_count <=  PAGE_COUNT_IN_AREA)){
+
+        #ifdef USE_KERNEL_SHRINK_INACTIVE_LIST
+		    isolate_pages = cold_mmap_file_isolate_lru_pages_and_shrink(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
+		    reclaimed_pages = p_hot_cold_file_global->hot_cold_file_shrink_counter.mmap_free_pages_count;
+        #else		
 			//隔离page
 			isolate_pages += cold_mmap_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
-			cold_page_count = 0;
-
 			//回收page
 			reclaimed_pages += cold_file_shrink_pages(p_hot_cold_file_global,p_file_stat,1);
+	    #endif
+			cold_page_count = 0;
 			printk("3:%s file_stat:0x%llx reclaimed_pages:%d isolate_pages:%d\n",__func__,(u64)p_file_stat,reclaimed_pages,isolate_pages);
 		}
 
@@ -4173,8 +4045,13 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 	printk("4:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
 	//如果本次对文件遍历结束后，有未达到BUF_PAGE_COUNT数目要回收的page，这里就隔离+回收这些page
 	if(cold_page_count){
+    #ifdef USE_KERNEL_SHRINK_INACTIVE_LIST
+		isolate_pages = cold_mmap_file_isolate_lru_pages_and_shrink(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
+		reclaimed_pages = p_hot_cold_file_global->hot_cold_file_shrink_counter.mmap_free_pages_count;
+    #else		
 		isolate_pages += cold_mmap_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
 		reclaimed_pages += cold_file_shrink_pages(p_hot_cold_file_global,p_file_stat,1);
+	#endif
 		printk("5:%s %s file_stat:0x%llx reclaimed_pages:%d isolate_pages:%d\n",__func__,p_file_stat->file_name,(u64)p_file_stat,reclaimed_pages,isolate_pages);
 	}
 
@@ -5119,12 +4996,11 @@ static int __init async_memory_reclaime_for_cold_file_area_init(void)
 		pr_err("kp__xfs_file_mmap register_kprobe failed, returned %d\n", ret);
 		//goto err;
 	}
-
+    
 	ret = hot_cold_file_init();
 	if(ret < 0){
 		goto err;
 	}
-
 	ret = hot_cold_file_proc_init(&hot_cold_file_global_info);
 	if(ret < 0){
 		goto err;
@@ -5160,7 +5036,8 @@ err:
 	if(hot_cold_file_global_info.hot_cold_file_thead)
 		kthread_stop(hot_cold_file_global_info.hot_cold_file_thead);
 
-	hot_cold_file_proc_exit(&hot_cold_file_global_info);
+    if(hot_cold_file_global_info.hot_cold_file_proc_root)
+	    hot_cold_file_proc_exit(&hot_cold_file_global_info);
 	return ret;
 }
 static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
