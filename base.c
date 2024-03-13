@@ -1502,6 +1502,12 @@ unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_col
 		for(i = 0;i < PAGE_COUNT_IN_AREA;i ++){
 			page = xa_load(&mapping->i_pages, p_file_area->start_index + i);
 			if (page && !xa_is_value(page)) {
+				
+				/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!还有其他异常状态*/
+				if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapBacked(page))){
+					panic("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx error\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags);
+				}
+
 				/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!*/
 				if (page_mapped(page)){
 					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page_mapped error!!!!!!!!!\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
@@ -1541,6 +1547,18 @@ unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_col
 					//对新的page所属的pgdat进行spin lock。内核遍历lru链表都是关闭中断的，这里也关闭中断
 					spin_lock_irq(&pgdat->lru_lock);
 				}
+				
+				/*实际调试发现，此时page可能还在lru缓存，没在lru链表。或者page在LRU_UNEVICTABLE这个lru链表。这两种情况的page
+				 *都不能参与回收，否则把这些page错误添加到inactive链表但没有令inactive lru链表的page数加1，最后隔离这些page时
+				 *会触发mem_cgroup_update_lru_size()中发现lru链表page个数是负数而告警而crash。并且，这个判断必要放到pgdat或
+				 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
+				 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
+				if(!PageLRU(page) || PageUnevictable(page)){
+					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+					unlock_page(page);
+					continue;
+				}
+
 				unlock_page(page);
 
 				/*这里又是另外一个核心点。由于现在前后两次的page不能保证处于同一个内存node、同一个memory、同一个lruvec，因此
@@ -1582,6 +1600,11 @@ unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_col
 			page = xa_load(&mapping->i_pages, p_file_area->start_index + i);
 			if (page && !xa_is_value(page)) {
 
+				/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!还有其他异常状态*/
+				if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapBacked(page))){
+					panic("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx error\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags);
+				}
+
 				//这里lock_page的原因上边有解释
 				if (!trylock_page(page)){
 					continue;
@@ -1606,6 +1629,18 @@ unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_col
 					//对新的page所属的pgdat进行spin lock
 					spin_lock_irq(&lruvec->lru_lock);
 				}
+				
+				/*实际调试发现，此时page可能还在lru缓存，没在lru链表。或者page在LRU_UNEVICTABLE这个lru链表。这两种情况的page
+				 *都不能参与回收，否则把这些page错误添加到inactive链表但没有令inactive lru链表的page数加1，最后隔离这些page时
+				 *会触发mem_cgroup_update_lru_size()中发现lru链表page个数是负数而告警而crash。并且，这个判断必要放到pgdat或
+				 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
+				 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
+				if(!PageLRU(page) || PageUnevictable(page)){
+					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+					unlock_page(page);
+					continue;
+				}
+
 				unlock_page(page);
 
 				dst = &p_hot_cold_file_global->p_hot_cold_file_node_pgdat[pgdat->node_id].pgdat_page_list;
@@ -1675,6 +1710,11 @@ unsigned int cold_mmap_file_isolate_lru_pages(struct hot_cold_file_global *p_hot
 		if(!test_bit(PG_locked,&page->flags)){
 			panic("%s page:0x%llx page->flags:0x%lx\n",__func__,(u64)page,page->flags);
 		}
+		
+		/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!还有其他异常状态*/
+		if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapBacked(page))){
+			panic("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx error\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags);
+		}
 
 		if(traverse_page_count++ >= 32){
 			traverse_page_count = 0;
@@ -1739,6 +1779,17 @@ unsigned int cold_mmap_file_isolate_lru_pages(struct hot_cold_file_global *p_hot
 			spin_lock_irq(&lruvec->lru_lock);
 		}
 #endif
+		/*实际调试发现，此时page可能还在lru缓存，没在lru链表。或者page在LRU_UNEVICTABLE这个lru链表。这两种情况的page
+		 *都不能参与回收，否则把这些page错误添加到inactive链表但没有令inactive lru链表的page数加1，最后隔离这些page时
+		 *会触发mem_cgroup_update_lru_size()中发现lru链表page个数是负数而告警而crash。并且，这个判断必要放到pgdat或
+		 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
+		 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
+		if(!PageLRU(page) || PageUnevictable(page)){
+			printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+			unlock_page(page);
+			continue;
+		}
+
 
 		//解锁。其实也可以不用解锁，这样async_shrink_free_page()函数回收内存时，就不用再加锁lock_page了，后期再考虑优化吧?????????????????
 		unlock_page(page);
@@ -1915,7 +1966,7 @@ unsigned long cold_file_isolate_lru_pages_and_shrink(struct hot_cold_file_global
 				}
 
 				/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!还有其他异常状态*/
-				if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapCache(page))){
+				if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapBacked(page))){
 					panic("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx error\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags);
 				}
 
@@ -1934,6 +1985,17 @@ unsigned long cold_file_isolate_lru_pages_and_shrink(struct hot_cold_file_global
 					spin_lock_irq(&pgdat->lru_lock);
 				}else{
 					lruvec_new = mem_cgroup_lruvec(page_memcg(page),pgdat);
+				}
+				
+				/*实际调试发现，此时page可能还在lru缓存，没在lru链表。或者page在LRU_UNEVICTABLE这个lru链表。这两种情况的page
+				 *都不能参与回收，否则把这些page错误添加到inactive链表但没有令inactive lru链表的page数加1，最后隔离这些page时
+				 *会触发mem_cgroup_update_lru_size()中发现lru链表page个数是负数而告警而crash。并且，这个判断必要放到pgdat或
+				 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
+				 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
+				if(!PageLRU(page) || PageUnevictable(page)){
+					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+					unlock_page(page);
+					continue;
 				}
 
 				//if成立条件如果前后的两个page的lruvec或所属node节点(pgdat)不一样 或者 遍历的page数达到32，强制进行一次内存回收
@@ -2020,7 +2082,7 @@ unsigned long cold_file_isolate_lru_pages_and_shrink(struct hot_cold_file_global
 #else
 		/*这个5.14.0-284.11.1.el9_2 内核分支分支，把大部分注释都删掉了,详细注释都在前边的分支*/
 
-                //得到file_area对应的page
+        //得到file_area对应的page
 		for(i = 0;i < PAGE_COUNT_IN_AREA;i ++){
 			page = pages[i];
 			if (page && !xa_is_value(page)) {
@@ -2028,8 +2090,10 @@ unsigned long cold_file_isolate_lru_pages_and_shrink(struct hot_cold_file_global
 					continue;
 				}
 
-				/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!还有其他异常状态*/
-				if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapCache(page))){
+				/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!还有其他异常状态。但实际调试
+				 *遇到过page来自tmpfs文件系统，即PageSwapBacked(page)，最后错误添加到inacitve lru链表，但没有令inactive lru
+				 *链表的page数加1，最后导致隔离page时触发mem_cgroup_update_lru_size()中发现lru链表page个数是负数而告警而crash*/
+				if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapBacked(page))){
 					panic("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx error\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags);
 				}
 
@@ -2047,6 +2111,16 @@ unsigned long cold_file_isolate_lru_pages_and_shrink(struct hot_cold_file_global
 					spin_lock_irq(&lruvec->lru_lock);
 				}else{
 					lruvec_new = mem_cgroup_lruvec_async(page_memcg(page),page_pgdat(page));
+				}
+				/*实际调试发现，此时page可能还在lru缓存，没在lru链表。或者page在LRU_UNEVICTABLE这个lru链表。这两种情况的page
+				 *都不能参与回收，否则把这些page错误添加到inactive链表但没有令inactive lru链表的page数加1，最后隔离这些page时
+				 *会触发mem_cgroup_update_lru_size()中发现lru链表page个数是负数而告警而crash。并且，这个判断必要放到pgdat或
+				 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
+				 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
+				if(!PageLRU(page) || PageUnevictable(page)){
+					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+					unlock_page(page);
+					continue;
 				}
 
 				//if成立条件如果前后的两个page的lruvec不一样 或者 遍历的page数达到32，强制进行一次内存回收
@@ -2267,7 +2341,7 @@ unsigned int cold_mmap_file_isolate_lru_pages_and_shrink(struct hot_cold_file_gl
 #endif
 
 		/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!还有其他异常状态*/
-		if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapCache(page))){
+		if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapBacked(page))){
 			panic("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx error\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags);
 		}
 
@@ -2280,6 +2354,13 @@ unsigned int cold_mmap_file_isolate_lru_pages_and_shrink(struct hot_cold_file_gl
 		}else{
 			lruvec_new = mem_cgroup_lruvec(page_memcg(page),pgdat);
 		}
+		
+		if(!PageLRU(page) || PageUnevictable(page)){
+			printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+			unlock_page(page);
+			continue;
+		}
+
 
 		//if成立条件如果前后的两个page的lruvec或所属node节点(pgdat)不一样 或者 遍历的page数达到32，强制进行一次内存回收
 
@@ -2349,10 +2430,10 @@ unsigned int cold_mmap_file_isolate_lru_pages_and_shrink(struct hot_cold_file_gl
 				
 	     /*这个5.14.0-284.11.1.el9_2 内核分支分支，把大部分注释都删掉了,详细注释都在前边的分支*/
 	     if (page && !xa_is_value(page)) {
-			/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!还有其他异常状态*/
-			if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapCache(page))){
-				panic("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx error\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags);
-			}
+			 /*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!还有其他异常状态*/
+			 if (unlikely(PageAnon(page))|| unlikely(PageCompound(page)) || unlikely(PageSwapBacked(page))){
+				 panic("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx error\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags);
+			 }
 			
 			//第一次循环，lruvec是NULL，则先加锁。并对lruvec赋值，这样下边的if才不会成立，然后误触发内存回收，此时还没有move page到inactive lru链表
 			if(NULL == lruvec){
@@ -2361,6 +2442,12 @@ unsigned int cold_mmap_file_isolate_lru_pages_and_shrink(struct hot_cold_file_gl
 				spin_lock_irq(&lruvec->lru_lock);
 			}else{
 				lruvec_new = mem_cgroup_lruvec_async(page_memcg(page),page_pgdat(page));
+			}
+			
+			if(!PageLRU(page) || PageUnevictable(page)){
+				printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+				unlock_page(page);
+				continue;
 			}
 
 			//if成立条件如果前后的两个page的lruvec不一样 或者 遍历的page数达到32，强制进行一次内存回收

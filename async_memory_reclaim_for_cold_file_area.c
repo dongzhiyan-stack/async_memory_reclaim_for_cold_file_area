@@ -614,7 +614,9 @@ static int inline is_file_stat_large_file(struct hot_cold_file_global *p_hot_col
 static inline struct address_space * hot_cold_file_page_mapping(struct page *page)
 {
 	struct address_space *mapping;
-	if (unlikely(PageSlab(page)) || unlikely(PageSwapCache(page)) || PageAnon(page) || page_mapped(page) || PageCompound(page))
+	/*pagecache读写的page不可能是PageSwapCache(page),并且PageAnon(page)与下边if((unsigned long)mapping&PAGE_MAPPING_ANON)重复了.
+	 *也不可能是PageSlab(page)。但tmpfs文件系统里的读写的文件页page，是PageSwapBacked的，这个要过滤掉*/
+	if (unlikely(PageSwapBacked(page)) || page_mapped(page) || PageCompound(page) /*PageAnon(page)|| PageSwapCache(page) ||PageSlab(page)*/)
 		return NULL;
 
 	mapping = page->mapping;
