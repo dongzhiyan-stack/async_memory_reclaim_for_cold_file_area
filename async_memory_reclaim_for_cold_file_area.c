@@ -275,9 +275,9 @@ static int cold_file_area_detele(struct hot_cold_file_global *p_hot_cold_file_gl
 	//槽位号slot_number是错误的，这样会导致错剔除其他的file_area
 	//int slot_number = p_file_area->start_index & TREE_MAP_MASK;
 	int slot_number = file_area_index & TREE_MAP_MASK;
+#if 0
 	int i;
 	int find = 0;
-
 	/*这是在遍历file_stat->file_area_free链表上的file_area期间，如果file_area长时间没访问就要执行该函数释放掉file_stat结构。
 	 *但是如果这个file_stat在p_file_stat->hot_file_area_cache数组，就要清理掉。但是如果此时有进程正执行hot_file_update_file_status()使用
 	 这个file_area,就阻塞所有执行hot_file_update_file_status函数的进程退出后(由p_hot_cold_file_global.ref_count为0保证)，再释放掉file_area*/
@@ -323,6 +323,15 @@ static int cold_file_area_detele(struct hot_cold_file_global *p_hot_cold_file_gl
 		 *p_file_stat->file_area_last的bit0的最新值1了*/
 		test_and_set_bit_lock(0,(unsigned long *)(&p_file_stat->file_area_last));
 		printk("%s file_stat:0x%llx file_area:0x%llx status:%d delete file_area_last\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
+		while(atomic_read(&p_hot_cold_file_global->ref_count))
+			msleep(1);
+	}
+#endif
+	/*如果待删除的file_area的父节点是p_file_stat->cache_file_area_tree_node，并且它只有一个file_area了，且这个file_area又要被删除了。
+	 *那就令cache_file_area_tree_node失效。并且要等所有进程退出hot_file_update_file_status函数，不再访问该文件的file_area radix tree后，
+	 *再去下边删除file_area和父节点。防止访问无效的内存*/
+	if(p_file_area->parent && p_file_area->parent == p_file_stat->cache_file_area_tree_node && p_file_area->parent->count == 1){
+		p_file_stat->cache_file_area_tree_node = NULL;
 		while(atomic_read(&p_hot_cold_file_global->ref_count))
 			msleep(1);
 	}
@@ -652,9 +661,14 @@ static int inline file_area_access_count_get(struct file_area *p_file_area)
 static int inline is_file_area_move_list_head(struct file_area *p_file_area)
 {
 	/*如果file_area当前周期内被访问次数达到阀值，则被移动到链表头。此时file_area可能处于file_stat的hot、refault、temp链表。必须是
-	 *if(file_area_access_count_get(p_file_area) == PAGE_COUNT_IN_AREA)，否则之后file_area没被访问一次，就要向链表头移动一次，太浪费性能。
-	 *目前限定每个周期内，file_area只能向file_stat的链表头移动一次*/
-	if((hot_cold_file_global_info.global_age == p_file_area->file_area_age) && (file_area_access_count_get(p_file_area) == PAGE_COUNT_IN_AREA)){
+	 *if(file_area_access_count_get(p_file_area) == PAGE_COUNT_IN_AREA)，否则之后file_area每被访问一次，就要向链表头移动一次，太浪费性能。
+	 *目前限定每个周期内，file_area只能向file_stat的链表头移动一次。为了降低性能损耗，感觉还是性能损耗有点大，比如访问一个2G的文件，从文件头
+	 *到文件尾的page每个都被访问一遍，于是每个file_area的page都被访问一次，这样if(file_area_access_count_get(p_file_area) == PAGE_COUNT_IN_AREA)
+	 *对每个file_area都成立，每个file_area都移动到file_area->hot、refault、temp链表头，太浪费性能了。于是把就调整成
+	 *file_area_access_count_get(p_file_area) > PAGE_COUNT_IN_AREA了!!!!!!!!!!!但这样有个问题，就是不能保证file_area被访问过就立即移动到
+	 *file_area->hot、refault、temp链表头，链表尾的file_area就不能保证全是冷file_area了。没办法，性能损耗比较大损耗也是要考虑的!!!!!!!!!!!!!!!!!!!*/
+	//if((hot_cold_file_global_info.global_age == p_file_area->file_area_age) && (file_area_access_count_get(p_file_area) == PAGE_COUNT_IN_AREA)){
+	if((hot_cold_file_global_info.global_age == p_file_area->file_area_age) && (file_area_access_count_get(p_file_area) > PAGE_COUNT_IN_AREA)){
 		return 1;
 	}
 	/*如果上个周期file_area被访问过，下个周期file_area又被访问，则也把file_area移动到链表头。file_area_access_count_get(p_file_area) > 0
@@ -710,11 +724,12 @@ int hot_file_update_file_status(struct page *page)
 		void **page_slot_in_tree = NULL;
 		//page所在的file_area的索引
 		unsigned int area_index_for_page;
-		struct hot_cold_file_area_tree_node *parent_node;
+		struct hot_cold_file_area_tree_node *parent_node = NULL;
 		int ret = 0;
 		struct file_stat * p_file_stat = NULL;
-		struct file_area *p_file_area = NULL,*p_file_area_temp = NULL; 
-		int i;
+		struct file_area *p_file_area = NULL;
+		//int i;
+		//struct file_area *p_file_area_temp = NULL;
 		int file_area_move_list_head = 0;
 		
 		//async_memory_reclaim_status不再使用smp_rmb内存屏障，而直接使用test_and_set_bit_lock/clear_bit_unlock原子操作
@@ -835,6 +850,22 @@ already_alloc:
 		//每个周期执行hot_file_update_file_status函数访问所有文件的所有file_area总次数
 		hot_cold_file_global_info.hot_cold_file_shrink_counter.all_file_area_access_count ++;
 
+		/*如果本次待查找的file_area在p_file_stat->cache_file_area_tree_node缓存数组里，直接获取不用再遍历file_area了*/
+		if(area_index_for_page >= p_file_stat->cache_file_area_tree_node_base_index && 
+				area_index_for_page <= (p_file_stat->cache_file_area_tree_node_base_index + TREE_MAP_MASK) && p_file_stat->cache_file_area_tree_node){
+			unsigned int offset = area_index_for_page & TREE_MAP_MASK;
+			p_file_area = p_file_stat->cache_file_area_tree_node->slots[offset];
+			/*必须要判断从cache_file_area_tree_node查找的file_area的索引跟本次访问的page的file_area索引是否相等，因为此时可能会有多个进程并发访问
+			 *同一个文件，在该函数末尾对p_file_stat->cache_file_area_tree_node_base_index 和 p_file_stat->cache_file_area_tree_node同时赋值，
+			 *导致cache_file_area_tree_node_base_index表示的不再是cache_file_area_tree_node的最小file_area的索引，就是二者不一致了!!!!!!!!*/
+			if(p_file_area && ((p_file_area->start_index >> PAGE_COUNT_IN_AREA_SHIFT) == area_index_for_page)){
+				parent_node = p_file_stat->cache_file_area_tree_node;
+				//printk("%s p_file_stat:0x%llx index:%ld area_index_for_page:%d find_file_area\n",__func__,(u64)p_file_stat,page->index,area_index_for_page);
+				goto find_file_area;
+			}
+			p_file_area = NULL;
+		}
+#if 0
 		/*先尝试从p_file_stat->file_area_last得到本次的file_area，file_area不能是热file_area。最近访问过的热file_area保存
 		 *在p_file_stat->hot_file_area_cache[]缓存数组。*/
 		if(p_file_stat->file_area_last){
@@ -894,6 +925,7 @@ already_alloc:
 				}
 			}
 		}
+#endif
 
 		/*按照本次的要查找的file_area索引area_index_for_page，从file_area_tree查找。如果查找成功，则page_slot_in_tree指向保存file_area的
 		 * 槽位，*page_slot_in_tree就是保存在这个槽位的file_area指针。这个过程不用file_stat->file_stat_lock加锁。首先是当进程执行到这里时
@@ -916,6 +948,7 @@ already_alloc:
 					panic("1:p_file_area->start_index:%ld != area_index_for_page:%d\n",p_file_area->start_index,(area_index_for_page << PAGE_COUNT_IN_AREA_SHIFT));
 
 find_file_area:
+				//检测file_area被访问的次数，判断是否有必要移动到file_stat->hot、refault、temp等链表头
 				file_area_move_list_head = is_file_area_move_list_head(p_file_area);
 
 				/*hot_cold_file_global_info.global_age更新了，把最新的global age更新到本次访问的file_area->file_area_age。并对
@@ -1094,7 +1127,7 @@ find_file_area:
 					hot_cold_file_global_info.hot_cold_file_shrink_counter.hot_file_area_count_one_period ++;
 					//该文件的热file_stat数加1
 					p_file_stat->file_area_hot_count ++;
-
+#if 0
 					/*热file_area保存到file_stat->hot_file_area_cache数组，作为缓存。在free_page_from_file_area()函数最后也会把频繁访问的
 					 * file_stat->file_area_temp链表上的file_area移动到file_stat->file_area_hot链表。这个概率很低，先不加了*/
 					if(p_file_stat->hot_file_area_cache_index >= FILE_AREA_CACHE_COUNT)
@@ -1111,6 +1144,7 @@ find_file_area:
 					//p_file_stat->hot_file_area_cache_index是否有必要做成原子变量，不用，这里加锁了file_stat->file_stat_lock锁，阻断了并发
 					if(++ p_file_stat->hot_file_area_cache_index > FILE_AREA_CACHE_COUNT - 1)
 						p_file_stat->hot_file_area_cache_index = 0;
+#endif					
 				}
 
 			//如果file_area处于file_stat的free_list或free_temp_list链表
@@ -1212,10 +1246,22 @@ out:
 		/*p_file_stat->file_area_last保存文件file_stat最近一次访问的file_area，方便下次加速访问。ret是0说明file_area和file_stat都成功访问到
 		 *并被赋值，二者都不会是NULL，不用再额外判断二者是否NULL*/
 		if(ret == 0){
+#if 0	
 			//ret的if判断和下边的if必须保证先后顺序
 			barrier();
 			if(p_file_stat->file_area_last != p_file_area && !file_area_in_hot_list(p_file_area))
 				p_file_stat->file_area_last = p_file_area;
+#endif
+			/*把最近一次访问的文件的file_area的父节点保存到cache_file_area_tree_node，它保存的最小file_area索引保存到
+			 *cache_file_area_tree_node_base_index。这样下次再访问同一个父节点的page的file_area，直接从cache_file_area_tree_node->slots[]数组
+			 *获取，就不用再遍历radix tree了。但是有个并发问题，就是可能会有多个进程并发访问同一个文件,然后在这里对二者同时赋值，这导致
+			 *cache_file_area_tree_node_base_index表示的不再是cache_file_area_tree_node的最小file_area的索引，就是二者不一致了。针对这个问题，
+			 *在前边使用二者的代码有防护。还有一个问题，就是如果cache_file_area_tree_node指向的node没删除了怎么办？在delete node的代码有防护，
+			 *必须等所有进程退出该函数，才能删除node，类似rcu宽限期，不过这里使用ref_count原子变量实现的*/
+			if(p_file_stat->cache_file_area_tree_node != parent_node){
+				p_file_stat->cache_file_area_tree_node = parent_node;
+				p_file_stat->cache_file_area_tree_node_base_index = area_index_for_page & (~TREE_MAP_MASK);
+			}
 		}
 
 		//防止原子操作之前重排序
@@ -1723,10 +1769,12 @@ static unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot
 				printk("%s file_area:0x%llx status:0x%x not in file_area_free !!!!!!!!!!!!\n",__func__,(u64)p_file_area,p_file_area->file_area_state);
 				continue;
 			}
-                        /*如果p_file_stat->file_area_last在file_stat->file_area_free链表上，经历过一个周期后还没被访问，那就清空p_file_stat->file_area_last这个cache*/
+#if 0	
+            /*如果p_file_stat->file_area_last在file_stat->file_area_free链表上，经历过一个周期后还没被访问，那就清空p_file_stat->file_area_last这个cache*/
 			if(p_file_stat->file_area_last == p_file_area){
 			    p_file_stat->file_area_last = NULL;
 			}
+#endif			
 
 			if(unlikely(file_area_access_count_get(p_file_area) > 0)){
 				/*这段代码时新加的，是个隐藏很深的小bug。file_area在内存回收前都要对access_count清0，但是在内存回收最后，可能因对应page
@@ -4199,7 +4247,7 @@ static int traverse_mmap_file_stat_get_cold_page(struct hot_cold_file_global *p_
 	int ret;
 
 	printk("1:%s file_stat:0x%llx file_stat->last_index:%ld file_area_count:%d traverse_done:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index,p_file_stat->file_area_count,p_file_stat->traverse_done);
-	if(p_file_stat->max_file_area_age || p_file_stat->hot_file_area_cache[0] || p_file_stat->hot_file_area_cache[1] ||p_file_stat->hot_file_area_cache[2]){
+	if(p_file_stat->max_file_area_age/* || p_file_stat->hot_file_area_cache[0] || p_file_stat->hot_file_area_cache[1] ||p_file_stat->hot_file_area_cache[2]*/){
 		panic("file_stat error p_file_stat:0x%llx\n",(u64)p_file_stat);
 	}
 

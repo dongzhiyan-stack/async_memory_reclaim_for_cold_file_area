@@ -286,11 +286,16 @@ struct file_stat
 	struct list_head file_area_free;
 	//file_area的page被释放后，但很快又被访问，发生了refault，于是要把这种page添加到file_area_refault链表，短时间内不再考虑扫描和释放
 	struct list_head file_area_refault;
-
+#if 0
 	//把最近访问的file_stat保存到hot_file_area_cache缓存数组，
 	struct file_area * hot_file_area_cache[FILE_AREA_CACHE_COUNT];
 	//最近一次访问的热file_area以hot_file_area_cache_index为下标保存到hot_file_area_cache数组
 	unsigned char hot_file_area_cache_index;
+#endif
+	/*file_area_tree_node保存最近一次访问file_area的父节点，cache_file_area_tree_node_base_index是它保存的最小file_area索引。
+	 *之后通过cache_file_area_tree_node->slots[]直接获取在同一个node的file_area，不用每次都遍历radix tree获取file_area*/
+	unsigned int cache_file_area_tree_node_base_index;
+	struct hot_cold_file_area_tree_node *cache_file_area_tree_node;
 
 	//最新一次访问的file_area
 	struct file_area *file_area_last;
