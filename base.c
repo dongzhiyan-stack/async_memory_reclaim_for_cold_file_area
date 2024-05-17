@@ -1508,9 +1508,9 @@ unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_col
 					panic("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx error\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags);
 				}
 
-				/*如果page映射了也表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!*/
+				/*如果page映射了页表页目录，这是异常的，要给出告警信息!!!!!!!!!!!!!!!!!!!*/
 				if (page_mapped(page)){
-					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page_mapped error!!!!!!!!!\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
+				    printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page_mapped error!!!!!!!!!\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
 				    continue;
 				}
 
@@ -1554,7 +1554,9 @@ unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_col
 				 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
 				 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
 				if(!PageLRU(page) || PageUnevictable(page)){
-					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+					if(shrink_page_printk_open1)
+						printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+
 					unlock_page(page);
 					continue;
 				}
@@ -1636,7 +1638,9 @@ unsigned long cold_file_isolate_lru_pages(struct hot_cold_file_global *p_hot_col
 				 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
 				 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
 				if(!PageLRU(page) || PageUnevictable(page)){
-					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+					if(shrink_page_printk_open1)
+						printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+
 					unlock_page(page);
 					continue;
 				}
@@ -1680,14 +1684,16 @@ unsigned int cold_mmap_file_isolate_lru_pages(struct hot_cold_file_global *p_hot
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
 	struct lruvec *lruvec = NULL,*lruvec_new = NULL;
 #endif
+	if(shrink_page_printk_open)
+		printk("1:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
 
-	printk("1:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
 	traverse_page_count = 0;
 	//对file_stat加锁
 	lock_file_stat(p_file_stat,0);
 	//如果文件inode和mapping已经释放了，则不能再使用mapping了，必须直接return
 	if(file_stat_in_delete(p_file_stat) || (NULL == p_file_stat->mapping)){
-		printk("2:%s file_stat:0x%llx %d_0x%llx\n",__func__,(u64)p_file_stat,file_stat_in_delete(p_file_stat),(u64)p_file_stat->mapping);
+		if(shrink_page_printk_open)
+			printk("2:%s file_stat:0x%llx %d_0x%llx\n",__func__,(u64)p_file_stat,file_stat_in_delete(p_file_stat),(u64)p_file_stat->mapping);
 		//如果异常退出，也要对page unlock
 		for(i = 0; i< cold_page_count;i ++)
 		{
@@ -1705,7 +1711,9 @@ unsigned int cold_mmap_file_isolate_lru_pages(struct hot_cold_file_global *p_hot
 	for(i = 0; i< cold_page_count;i ++)
 	{
 		page = page_buf[i];
-		printk("3:%s file_stat:0x%llx file_area:0x%llx page:0x%llx\n",__func__,(u64)p_file_stat,(u64)p_file_area,(u64)page);
+		if(shrink_page_printk_open)
+			printk("3:%s file_stat:0x%llx file_area:0x%llx page:0x%llx\n",__func__,(u64)p_file_stat,(u64)p_file_area,(u64)page);
+
 		//此时page肯定是加锁状态，否则就主动触发crash
 		if(!test_bit(PG_locked,&page->flags)){
 			panic("%s page:0x%llx page->flags:0x%lx\n",__func__,(u64)page,page->flags);
@@ -1785,7 +1793,9 @@ unsigned int cold_mmap_file_isolate_lru_pages(struct hot_cold_file_global *p_hot
 		 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
 		 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
 		if(!PageLRU(page) || PageUnevictable(page)){
-			printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+			if(shrink_page_printk_open)
+				printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+
 			unlock_page(page);
 			continue;
 		}
@@ -1993,7 +2003,9 @@ unsigned long cold_file_isolate_lru_pages_and_shrink(struct hot_cold_file_global
 				 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
 				 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
 				if(!PageLRU(page) || PageUnevictable(page)){
-					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+					if(shrink_page_printk_open1)
+						printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+
 					unlock_page(page);
 					continue;
 				}
@@ -2118,7 +2130,9 @@ unsigned long cold_file_isolate_lru_pages_and_shrink(struct hot_cold_file_global
 				 *lruvec加锁里，因为可能会被其他进程并发设置page的LRU属性或者设置page为PageUnevictable(page)然后移动到其他lru
 				 *链表，这样状态纠错了。因此这段代码必须放到pgdat或lruvec加锁了!!!!!!!!!!!!!!!!!!!!!*/
 				if(!PageLRU(page) || PageUnevictable(page)){
-					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+					if(shrink_page_printk_open1)
+						printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+
 					unlock_page(page);
 					continue;
 				}
@@ -2259,14 +2273,17 @@ unsigned int cold_mmap_file_isolate_lru_pages_and_shrink(struct hot_cold_file_gl
 		.no_demotion = 1,//高版本内核多了一个no_demotion
 #endif
 	};
+	if(shrink_page_printk_open)
+		printk("1:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
 
-	printk("1:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
 	traverse_page_count = 0;
 	//对file_stat加锁
 	lock_file_stat(p_file_stat,0);
 	//如果文件inode和mapping已经释放了，则不能再使用mapping了，必须直接return
 	if(file_stat_in_delete(p_file_stat) || (NULL == p_file_stat->mapping)){
-		printk("2:%s file_stat:0x%llx %d_0x%llx\n",__func__,(u64)p_file_stat,file_stat_in_delete(p_file_stat),(u64)p_file_stat->mapping);
+		if(shrink_page_printk_open)
+			printk("2:%s file_stat:0x%llx %d_0x%llx\n",__func__,(u64)p_file_stat,file_stat_in_delete(p_file_stat),(u64)p_file_stat->mapping);
+
 		//如果异常退出，也要对page unlock
 		for(i = 0; i< cold_page_count;i ++)
 		{
@@ -2284,7 +2301,9 @@ unsigned int cold_mmap_file_isolate_lru_pages_and_shrink(struct hot_cold_file_gl
 	for(i = 0; i< cold_page_count;i ++)
 	{
 		page = page_buf[i];
-		printk("3:%s file_stat:0x%llx file_area:0x%llx page:0x%llx\n",__func__,(u64)p_file_stat,(u64)p_file_area,(u64)page);
+		if(shrink_page_printk_open)
+			printk("3:%s file_stat:0x%llx file_area:0x%llx page:0x%llx\n",__func__,(u64)p_file_stat,(u64)p_file_area,(u64)page);
+
 		//此时page肯定是加锁状态，否则就主动触发crash
 		if(!test_bit(PG_locked,&page->flags)){
 			panic("%s page:0x%llx page->flags:0x%lx\n",__func__,(u64)page,page->flags);
@@ -2356,7 +2375,9 @@ unsigned int cold_mmap_file_isolate_lru_pages_and_shrink(struct hot_cold_file_gl
 		}
 		
 		if(!PageLRU(page) || PageUnevictable(page)){
-			printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+			if(shrink_page_printk_open1)
+				printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+
 			unlock_page(page);
 			continue;
 		}
@@ -2445,7 +2466,9 @@ unsigned int cold_mmap_file_isolate_lru_pages_and_shrink(struct hot_cold_file_gl
 			}
 			
 			if(!PageLRU(page) || PageUnevictable(page)){
-				printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+				if(shrink_page_printk_open1)
+					printk("%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx flags:0x%lx LRU:%d PageUnevictable:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page,page->flags,PageLRU(page),PageUnevictable(page));
+
 				unlock_page(page);
 				continue;
 			}

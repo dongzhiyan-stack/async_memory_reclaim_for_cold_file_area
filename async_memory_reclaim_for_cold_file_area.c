@@ -835,7 +835,8 @@ already_alloc:
 			 *实际测试证实，是正常现象!!!!!!!!!!!!!!!!!!!!!!!!!!!!*/
 
 			//p_file_stat->mapping->rh_reserved1 = 0;
-			printk("%s p_file_stat:0x%llx status:0x%lx in_mmap_file\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status);
+			if(shrink_page_printk_open1)
+				printk("%s p_file_stat:0x%llx status:0x%lx in_mmap_file\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status);
 			goto out;
 		}
 		/*分析证实，此时file_stat是可能在file_stat_has_zero_file_area_manage->cold_file_stat_delete()中被并发标记delete的。防护措施
@@ -1681,7 +1682,7 @@ static unsigned long free_page_from_file_area(struct hot_cold_file_global *p_hot
 		free_pages += cold_file_shrink_pages(p_hot_cold_file_global,p_file_stat,0);
 #endif
 
-		//if(shrink_page_printk_open1)
+		if(shrink_page_printk_open1)
 			printk("1:%s %s %d p_hot_cold_file_global:0x%llx p_file_stat:0x%llx status:0x%lx free_pages:%d\n",__func__,current->comm,current->pid,(u64)p_hot_cold_file_global,(u64)p_file_stat,p_file_stat->file_stat_status,free_pages);
 
 		/*注意，file_stat->file_area_free_temp 和 file_stat->file_area_free 各有用处。file_area_free_temp保存每次扫描释放的page的file_area。
@@ -2746,7 +2747,8 @@ static int  solve_reclaim_fail_page(struct hot_cold_file_global *p_hot_cold_file
 			    clear_file_area_in_free_list(p_file_area);
 			    set_file_area_in_refault_list(p_file_area);
 			    list_move(&p_file_area->file_area_list,&p_file_stat->file_area_refault);
-			    printk("%s page:0x%llx file_area:0x%llx status:%d move to refault list\n",__func__,(u64)page,(u64)p_file_area,p_file_area->file_area_state);
+				if(shrink_page_printk_open1)
+					printk("%s page:0x%llx file_area:0x%llx status:%d move to refault list\n",__func__,(u64)page,(u64)p_file_area,p_file_area->file_area_state);
 			}
 			else{
 				p_file_stat->mapcount_file_area_count ++;
@@ -2754,7 +2756,8 @@ static int  solve_reclaim_fail_page(struct hot_cold_file_global *p_hot_cold_file
 			    clear_file_area_in_free_list(p_file_area);
 			    set_file_area_in_mapcount_list(p_file_area);
 			    list_move(&p_file_area->file_area_list,&p_file_stat->file_area_mapcount);
-			    printk("%s page:0x%llx file_area:0x%llx status:%d move to mapcount list\n",__func__,(u64)page,(u64)p_file_area,p_file_area->file_area_state);
+				if(shrink_page_printk_open1)
+					printk("%s page:0x%llx file_area:0x%llx status:%d move to mapcount list\n",__func__,(u64)page,(u64)p_file_area,p_file_area->file_area_state);
 
 				/*如果文件file_stat的mapcount的file_area个数超过阀值，则file_stat被判定为mapcount file_stat而移动到
 			    *global mmap_file_stat_mapcount_head链表。但前提file_stat必须在temp_file链表或temp_large_file链表*/
@@ -2766,7 +2769,8 @@ static int  solve_reclaim_fail_page(struct hot_cold_file_global *p_hot_cold_file
 					 set_file_stat_in_mapcount_file_area_list(p_file_stat);
 					 list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->mmap_file_stat_mapcount_head);
 					 p_hot_cold_file_global->mapcount_mmap_file_stat_count ++;
-					 printk("%s file_stat:0x%llx status:0x%llx is mapcount file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
+					 if(shrink_page_printk_open1)
+						 printk("%s file_stat:0x%llx status:0x%llx is mapcount file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
 				}
 			}
 		}
@@ -2856,7 +2860,9 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 	memset(pages,0,PAGE_COUNT_IN_AREA*sizeof(struct page *));
 	//获取p_file_area对应的文件页page指针并保存到pages数组
 	ret = get_page_from_file_area(p_file_stat,p_file_area->start_index,pages);
-	printk("1:%s file_stat:0x%llx file_area:0x%llx get %d page\n",__func__,(u64)p_file_stat,(u64)p_file_area,ret);
+	if(shrink_page_printk_open)
+		printk("1:%s file_stat:0x%llx file_area:0x%llx get %d page\n",__func__,(u64)p_file_stat,(u64)p_file_area,ret);
+
 	if(ret <= 0)
 	    goto out; 
 
@@ -2874,14 +2880,17 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 			 *这个page然后lock_pagea。后者page并不是被其他进程被访问而lock了！因此只能用lock_page了，然后再
 			 *page_referenced判断page pte，因为这个page可能被其他进程内存回收而lock_page，并不是被访问了lock_page
 			 */
-			printk("2:%s page:0x%llx index:%ld %ld_%d\n",__func__,(u64)page,page->index,p_file_area->start_index,i);
+			if(shrink_page_printk_open)
+				printk("2:%s page:0x%llx index:%ld %ld_%d\n",__func__,(u64)page,page->index,p_file_area->start_index,i);
 			lock_page(page);
 			//if(trylock_page(page))------不要删
 			{
 				/*如果page被其他进程回收了，if不成立，这些就不再对该file_area的其他page进行内存回收了，其实
 				 *也可以回收，但是处理起来很麻烦，后期再考虑优化优化细节吧!!!!!!!!!!!!!!!!!!!!!!*/
 				if(page->mapping != mapping){
-					printk("3:%s file_stat:0x%llx file_area:0x%llx status:0x%x page->mapping != mapping!!!!!!!!!\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
+					if(shrink_page_printk_open1)
+						printk("3:%s file_stat:0x%llx file_area:0x%llx status:0x%x page->mapping != mapping!!!!!!!!!\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
+
 					unlock_page(page);
 					continue;
 				}
@@ -2889,7 +2898,9 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 				 *这个判断必须放到lock_page后边*/
 				if (!page_mapped(page)){
 					unlock_page(page);
-					printk("4:%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx not in page_mapped error!!!!!!\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page);
+					if(shrink_page_printk_open1)
+						printk("4:%s file_stat:0x%llx file_area:0x%llx status:0x%x page:0x%llx not in page_mapped error!!!!!!\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state,(u64)page);
+
 					continue;
 				}
 				
@@ -2903,7 +2914,9 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 #else
 				ret += page_referenced_async(page_folio(page), 1, page_memcg(page),&vm_flags);
 #endif
-				printk("5:%s file_stat:0x%llx file_area:0x%llx page:0x%llx index:%ld file_area_cold:%d cold_page_count:%d ret:%d page_mapcount:%d access_count:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,(u64)page,page->index,file_area_cold,cold_page_count == NULL ?-1:*cold_page_count,ret,page_mapcount(page),file_area_access_count_get(p_file_area));
+				if(shrink_page_printk_open)
+					printk("5:%s file_stat:0x%llx file_area:0x%llx page:0x%llx index:%ld file_area_cold:%d cold_page_count:%d ret:%d page_mapcount:%d access_count:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,(u64)page,page->index,file_area_cold,cold_page_count == NULL ?-1:*cold_page_count,ret,page_mapcount(page),file_area_access_count_get(p_file_area));
+
 				/*ret大于0说明page最近被访问了，不是冷page，则赋值全局age*/
 				if(ret > 0){
 					unlock_page(page);
@@ -2936,7 +2949,8 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 								list_move(&p_file_area->file_area_list,&p_file_stat->file_area_hot);
 								//该文件的热file_area数加1
 								p_file_stat->file_area_hot_count ++;
-								printk("6:%s file_stat:0x%llx file_area:0x%llx is hot status:0x%x\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
+								if(shrink_page_printk_open)
+									printk("6:%s file_stat:0x%llx file_area:0x%llx is hot status:0x%x\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
 
 								//如果文件的热file_area个数超过阀值则被判定为热文件，文件file_stat移动到global mmap_file_stat_hot_head链表
 								if(is_mmap_file_stat_hot_file(p_hot_cold_file_global,p_file_stat) && file_stat_in_file_stat_temp_head_list(p_file_stat)){
@@ -2944,7 +2958,8 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 									set_file_stat_in_file_stat_hot_head_list(p_file_stat);
 									list_move(&p_file_stat->hot_cold_file_list,&hot_cold_file_global_info.mmap_file_stat_hot_head);
 									hot_cold_file_global_info.hot_mmap_file_stat_count ++;
-								    printk("7:%s file_stat:0x%llx status:0x%llx is hot file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
+									if(shrink_page_printk_open)
+										printk("7:%s file_stat:0x%llx status:0x%llx is hot file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
 								}
 							}
 						}else{
@@ -3021,7 +3036,8 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 			clear_file_area_in_temp_list(p_file_area);
 			set_file_area_in_mapcount_list(p_file_area);
 			list_move(&p_file_area->file_area_list,&p_file_stat->file_area_mapcount);
-			printk("8:%s file_stat:0x%llx file_area:0x%llx state:0x%x temp to mapcount\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
+			if(shrink_page_printk_open)
+				printk("8:%s file_stat:0x%llx file_area:0x%llx state:0x%x temp to mapcount\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
 
 			/*如果文件file_stat的mapcount的file_area个数超过阀值，则file_stat被判定为mapcount file_stat而移动到
 			 *global mmap_file_stat_mapcount_head链表。但前提file_stat必须在temp_file链表或temp_large_file链表*/
@@ -3033,7 +3049,8 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 				 set_file_stat_in_mapcount_file_area_list(p_file_stat);
 				 list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->mmap_file_stat_mapcount_head);
 				 p_hot_cold_file_global->mapcount_mmap_file_stat_count ++;
-				 printk("9:%s file_stat:0x%llx status:0x%llx is mapcount file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
+				 if(shrink_page_printk_open1)
+					 printk("9:%s file_stat:0x%llx status:0x%llx is mapcount file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
 			}
 		}
     }
@@ -3052,7 +3069,9 @@ static  unsigned int check_one_file_area_cold_page_and_clear(struct hot_cold_fil
 		for(j = 0 ;j < i;j++){
 			page = page_buf[*cold_page_count + j];
 			if(page){
-				printk("10:%s file_stat:0x%llx file_area:0x%llx cold_page_count:%d page:0x%llx\n",__func__,(u64)p_file_stat,(u64)p_file_area,*cold_page_count,(u64)page);
+				if(shrink_page_printk_open1)
+					printk("10:%s file_stat:0x%llx file_area:0x%llx cold_page_count:%d page:0x%llx\n",__func__,(u64)p_file_stat,(u64)p_file_area,*cold_page_count,(u64)page);
+
 				unlock_page(page);
 			}
 		}
@@ -3080,7 +3099,9 @@ static int reverse_other_file_area_list(struct hot_cold_file_global *p_hot_cold_
 		//如果file_area_list_head 链表尾的file_area在规定周期内不再遍历，降低性能损耗。链表尾的file_area的file_area_access_age更小，
 		//它的file_area_access_age与global_age相差小于age_dx，链表头的更小于
 		if(p_hot_cold_file_global->global_age - p_file_area->file_area_access_age <= age_dx){
-	        printk("1:%s file_stat:0x%llx type:%d  global_age:%ld file_area_access_age:%ld age_dx:%d\n",__func__,(u64)p_file_stat,type,p_hot_cold_file_global->global_age,p_file_area->file_area_access_age,age_dx);
+			if(shrink_page_printk_open)
+				printk("1:%s file_stat:0x%llx type:%d  global_age:%ld file_area_access_age:%ld age_dx:%d\n",__func__,(u64)p_file_stat,type,p_hot_cold_file_global->global_age,p_file_area->file_area_access_age,age_dx);
+
 			break;
 		}
 		if(scan_file_area_count ++ > traversal_max_count)
@@ -3094,7 +3115,9 @@ static int reverse_other_file_area_list(struct hot_cold_file_global *p_hot_cold_
 			memset(pages,0,PAGE_COUNT_IN_AREA*sizeof(struct page *));
 			//获取p_file_area对应的文件页page指针并保存到pages数组
 			ret = get_page_from_file_area(p_file_stat,p_file_area->start_index,pages);
-			printk("1:%s file_stat:0x%llx file_area:0x%llx get %d page--------->\n",__func__,(u64)p_file_stat,(u64)p_file_area,ret);
+			if(shrink_page_printk_open1)
+				printk("1:%s file_stat:0x%llx file_area:0x%llx get %d page--------->\n",__func__,(u64)p_file_stat,(u64)p_file_area,ret);
+
 			//file_area被遍历到时记录当时的global_age，不管此时file_area的page是否被访问pte置位了
 			p_file_area->file_area_access_age = p_hot_cold_file_global->global_age;
 			//这个file_area没有page，直接遍历下一个file_area
@@ -3138,8 +3161,9 @@ static int reverse_other_file_area_list(struct hot_cold_file_global *p_hot_cold_
 			ret = check_one_file_area_cold_page_and_clear(p_hot_cold_file_global,p_file_stat,p_file_area,NULL,NULL);
 			//file_area的page被访问了，依然停留在hot链表
 			if(ret > 0){
-				/*否则file_area移动到file_area_list临时链表。但要防止前边file_area被移动到其他file_stat的链表了，此时就不能再把该file_area
-				 *移动到file_area_list临时链表，否则该函数最后会把file_area再移动到老的file_stat链表，file_area的状态和所处链表就错乱了，会crash*/
+				/*否则file_area移动到file_area_list临时链表。但要防止前边check_one_file_area_cold_page_and_clear()函数file_area被
+				 *移动到其他file_stat的链表了，此时就不能再把该file_area移动到file_area_list临时链表，
+				 否则该函数最后会把file_area再移动到老的file_stat链表，file_area的状态和所处链表就错乱了，会crash*/
 				if(file_area_in_hot_list(p_file_area))
 				    list_move(&p_file_area->file_area_list,&file_area_list);
 				else
@@ -3172,8 +3196,9 @@ static int reverse_other_file_area_list(struct hot_cold_file_global *p_hot_cold_
 			//检测file_area的page最近是否被访问了
 			ret = check_one_file_area_cold_page_and_clear(p_hot_cold_file_global,p_file_stat,p_file_area,NULL,NULL);
 			if(ret > 0){
-				/*否则file_area移动到file_area_list临时链表。但要防止前边file_area被移动到其他file_stat的链表了，此时就不能再把该file_area
-				 *移动到file_area_list临时链表，否则该函数最后会把file_area再移动到老的file_stat链表，file_area的状态和所处链表就错乱了，会crash*/
+				/*否则file_area移动到file_area_list临时链表。但要防止前边check_one_file_area_cold_page_and_clear()函数file_area被
+				 *移动到其他file_stat的链表了，此时就不能再把该file_area移动到file_area_list临时链表，
+				 否则该函数最后会把file_area再移动到老的file_stat链表，file_area的状态和所处链表就错乱了，会crash*/
 				if(file_area_in_refault_list(p_file_area))
 				    list_move(&p_file_area->file_area_list,&file_area_list);
 				else
@@ -3211,8 +3236,9 @@ static int reverse_other_file_area_list(struct hot_cold_file_global *p_hot_cold_
 					clear_file_area_in_free_list(p_file_area);
 					cold_file_area_detele_quick(p_hot_cold_file_global,p_file_stat,p_file_area);
 				}else{
-					/*否则file_area移动到file_area_list临时链表。但要防止前边file_area被移动到其他file_stat的链表了，此时就不能再把该file_area
-					 *移动到file_area_list临时链表，否则该函数最后会把file_area再移动到老的file_stat链表，file_area的状态和所处链表就错乱了，会crash*/
+					/*否则file_area移动到file_area_list临时链表。但要防止前边check_one_file_area_cold_page_and_clear()函数file_area被
+					 *移动到其他file_stat的链表了，此时就不能再把该file_area移动到file_area_list临时链表，
+					 否则该函数最后会把file_area再移动到老的file_stat链表，file_area的状态和所处链表就错乱了，会crash*/
 					if(file_area_in_free_list(p_file_area))
 						list_move(&p_file_area->file_area_list,&file_area_list);
 					else
@@ -3256,8 +3282,8 @@ static int reverse_other_file_area_list(struct hot_cold_file_global *p_hot_cold_
 	if(!list_empty(&file_area_list)){
 		list_splice(&file_area_list,file_area_list_head);
 	}
-
-	printk("2:%s file_stat:0x%llx type:%d scan_file_area_count:%d\n",__func__,(u64)p_file_stat,type,scan_file_area_count);
+	if(shrink_page_printk_open1)
+		printk("2:%s file_stat:0x%llx type:%d scan_file_area_count:%d\n",__func__,(u64)p_file_stat,type,scan_file_area_count);
 	return scan_file_area_count;
 }
 
@@ -3600,7 +3626,9 @@ static int check_page_exist_and_create_file_area(struct hot_cold_file_global *p_
 	memset(pages,0,PAGE_COUNT_IN_AREA*sizeof(struct page *));
 	//获取p_file_area对应的文件页page指针并保存到pages数组
 	ret = get_page_from_file_area(p_file_stat,start_page_index,pages);
-	printk("1:%s file_stat:0x%llx start_page_index:%ld get %d page\n",__func__,(u64)p_file_stat,start_page_index,ret);
+	if(shrink_page_printk_open)
+		printk("1:%s file_stat:0x%llx start_page_index:%ld get %d page\n",__func__,(u64)p_file_stat,start_page_index,ret);
+
 	if(ret <= 0)
 	    goto out; 
 
@@ -3670,7 +3698,8 @@ static int check_page_exist_and_create_file_area(struct hot_cold_file_global *p_
 		clear_file_area_in_temp_list(p_file_area);
 		set_file_area_in_mapcount_list(p_file_area);
 		list_move(&p_file_area->file_area_list,&p_file_stat->file_area_mapcount);
-		printk("5:%s file_stat:0x%llx file_area:0x%llx state:0x%x is mapcount file_area\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
+		if(shrink_page_printk_open)
+			printk("5:%s file_stat:0x%llx file_area:0x%llx state:0x%x is mapcount file_area\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
 
 		/*如果文件file_stat的mapcount的file_area个数超过阀值，则file_stat被判定为mapcount file_stat而移动到
 		 *global mmap_file_stat_mapcount_head链表。但前提file_stat必须在temp_file链表或temp_large_file链表*/
@@ -3682,7 +3711,8 @@ static int check_page_exist_and_create_file_area(struct hot_cold_file_global *p_
 			 set_file_stat_in_mapcount_file_area_list(p_file_stat);
 			 list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->mmap_file_stat_mapcount_head);
 		 	 p_hot_cold_file_global->mapcount_mmap_file_stat_count ++;
-			 printk("6:%s file_stat:0x%llx status:0x%llx is mapcount file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
+			 if(shrink_page_printk_open1)
+				 printk("6:%s file_stat:0x%llx status:0x%llx is mapcount file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
 		}
 	}
 
@@ -3704,8 +3734,8 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 	//p_file_stat->traverse_done是0，说明还没有遍历完一次文件的page，那先返回
 	if(0 == p_file_stat->traverse_done)
 		return ret;
-
-	printk("1:%s file_stat:0x%llx file_stat->last_index:%ld\n",__func__,(u64)p_file_stat,p_file_stat->last_index);
+	if(shrink_page_printk_open)
+		printk("1:%s file_stat:0x%llx file_stat->last_index:%ld\n",__func__,(u64)p_file_stat,p_file_stat->last_index);
 
 	//p_file_stat->last_index初值是0，后续依次是64*1、64*2、64*3等等，
 	base_area_index = p_file_stat->last_index;
@@ -3750,13 +3780,17 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 
 			start_page_index = (base_area_index + j) << PAGE_COUNT_IN_AREA_SHIFT;
 			if(start_page_index >= file_page_count){
-				printk("3:%s start_page_index:%d >= file_page_count:%d\n",__func__,start_page_index,file_page_count);
+				if(shrink_page_printk_open)
+					printk("3:%s start_page_index:%d >= file_page_count:%d\n",__func__,start_page_index,file_page_count);
+
 				goto out;
 			}
-			if(page_slot_in_tree)
-				printk("4:%s file_stat:0x%llx i:%d j:%d start_page_index:%d base_area_index:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,start_page_index,base_area_index,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
-			else
-				printk("4:%s file_stat:0x%llx i:%d j:%d start_page_index:%d base_area_index:%d parent_node:0x%llx page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,start_page_index,base_area_index,(u64)parent_node,(u64)page_slot_in_tree);
+			if(shrink_page_printk_open){
+				if(page_slot_in_tree)
+					printk("4:%s file_stat:0x%llx i:%d j:%d start_page_index:%d base_area_index:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,start_page_index,base_area_index,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
+				else
+					printk("4:%s file_stat:0x%llx i:%d j:%d start_page_index:%d base_area_index:%d parent_node:0x%llx page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,start_page_index,base_area_index,(u64)parent_node,(u64)page_slot_in_tree);
+			}
 
 			/* (NULL == page_slot_in_tree)：对应情况2，radix tree现在节点太少，待查找的file_area索引太大找不到父节点和file_area的槽位，
 			 * parent_node 和 page_slot_in_tree都是NULL。那就执行check_page_exist_and_create_file_area()分配父节点 parent_node，并令page_slot_in_tree指向
@@ -3776,7 +3810,8 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 					goto out;
 				}else if(ret >0){
 					//ret 大于0说明上边创建了file_area或者node节点，这里再打印出来
-					printk("6:%s file_stat:0x%llx i:%d j:%d start_page_index:%d base_area_index:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,start_page_index,base_area_index,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
+					if(shrink_page_printk_open)
+						printk("6:%s file_stat:0x%llx i:%d j:%d start_page_index:%d base_area_index:%d parent_node:0x%llx page_slot_in_tree:0x%llx *page_slot_in_tree:0x%llx\n",__func__,(u64)p_file_stat,i,j,start_page_index,base_area_index,(u64)parent_node,(u64)page_slot_in_tree,(u64)(*page_slot_in_tree));
 				}
 			}
 
@@ -3856,7 +3891,9 @@ static unsigned int reverse_file_stat_radix_tree_hole(struct hot_cold_file_globa
 	p_file_stat->last_index = base_area_index;
 out:
 	if((ret >= 0) && ((base_area_index +j) << PAGE_COUNT_IN_AREA_SHIFT >= file_page_count)){
-		printk("7:%s last_index = 0 last_index:%ld base_area_index:%d j:%d file_page_count:%d\n",__func__,p_file_stat->last_index,base_area_index,j,file_page_count);
+		if(shrink_page_printk_open1)
+			printk("7:%s last_index = 0 last_index:%ld base_area_index:%d j:%d file_page_count:%d\n",__func__,p_file_stat->last_index,base_area_index,j,file_page_count);
+
 		//p_file_stat->last_index清0，下次从头开始扫描文件页
 		p_file_stat->last_index = 0;
 	}
@@ -3893,8 +3930,8 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 	 *的file_area，如果不是mapcount了，那就降级到file_stat->file_area_temp链表。没有遍历file_stat->file_area_temp链表上的file_area，如果对应page的mapcount大于1
 	 *了，再把file_area升级到file_stat->file_area_mapcount链表。如果mapcount的file_area个数超过阀值，那就升级file_stat到mapcount文件。这个有必要做吗???????，
 	 *想想还是做吧，否则这种file_area的page回收时很容易失败*/
-
-	printk("1:%s file_stat:0x%llx file_area_last:0x%llx file_area_count_in_temp_list:%d file_area_hot_count:%d mapcount_file_area_count:%d file_area_count:%d\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_area_last,p_file_stat->file_area_count_in_temp_list,p_file_stat->file_area_hot_count,p_file_stat->mapcount_file_area_count,p_file_stat->file_area_count);
+	if(shrink_page_printk_open)
+		printk("1:%s file_stat:0x%llx file_area_last:0x%llx file_area_count_in_temp_list:%d file_area_hot_count:%d mapcount_file_area_count:%d file_area_count:%d\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_area_last,p_file_stat->file_area_count_in_temp_list,p_file_stat->file_area_hot_count,p_file_stat->mapcount_file_area_count,p_file_stat->file_area_count);
 
 	if(p_file_stat->file_area_last){//本次从上一轮扫描打断的file_stat继续遍历
 		p_file_area = p_file_stat->file_area_last;
@@ -3919,15 +3956,17 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 			//从链表尾遍历完一轮file_area了，文件file_stat要进入冷却期
 			p_file_stat->cooling_off_start = 1;
 			//记录此时的全局age
-			p_file_stat->cooling_off_start_age = p_hot_cold_file_global->global_age; 
-			printk("1_1:%s file_stat:0x%llx cooling_off_start age:%ld\n",__func__,(u64)p_file_stat,p_file_stat->cooling_off_start_age);
+			p_file_stat->cooling_off_start_age = p_hot_cold_file_global->global_age;
+			if(shrink_page_printk_open)
+				printk("1_1:%s file_stat:0x%llx cooling_off_start age:%ld\n",__func__,(u64)p_file_stat,p_file_stat->cooling_off_start_age);
 
 			p_file_area_temp = list_last_entry(&p_file_stat->file_area_temp,struct file_area,file_area_list);
 		}
 
 		/*遍历file_stat->file_area_temp，查找冷的file_area*/
 		cold_page_count_last = cold_page_count;
-		printk("2:%s file_stat:0x%llx file_area:0x%llx index:%ld scan_file_area_count_temp_list:%d file_area_count_in_temp_list:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->start_index,p_file_stat->scan_file_area_count_temp_list,p_file_stat->file_area_count_in_temp_list);
+		if(shrink_page_printk_open)
+			printk("2:%s file_stat:0x%llx file_area:0x%llx index:%ld scan_file_area_count_temp_list:%d file_area_count_in_temp_list:%d\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->start_index,p_file_stat->scan_file_area_count_temp_list,p_file_stat->file_area_count_in_temp_list);
 	
 	    //这个错误赋值会影响到file_stat->access_count，导致误判为热file_area	
 		//p_file_area->file_area_access_age = p_hot_cold_file_global->global_age;
@@ -4027,7 +4066,8 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 			reclaimed_pages += cold_file_shrink_pages(p_hot_cold_file_global,p_file_stat,1);
 	    #endif
 			cold_page_count = 0;
-			printk("3:%s file_stat:0x%llx reclaimed_pages:%d isolate_pages:%d\n",__func__,(u64)p_file_stat,reclaimed_pages,isolate_pages);
+			if(shrink_page_printk_open)
+				printk("3:%s file_stat:0x%llx reclaimed_pages:%d isolate_pages:%d\n",__func__,(u64)p_file_stat,reclaimed_pages,isolate_pages);
 		}
 
 		/*下一个扫描的file_area。这个对p_file_area赋值p_file_area_temp，要放到if(*already_scan_file_area_count > scan_file_area_max) break;
@@ -4092,7 +4132,9 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 		//把本次扫描的暂存在file_area_temp_head临时链表上的不太冷的file_area移动到file_stat->file_area_temp链表尾
 		list_splice_tail(&file_area_temp_head,&p_file_stat->file_area_temp);
 
-	printk("4:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
+    if(shrink_page_printk_open)
+	    printk("4:%s file_stat:0x%llx cold_page_count:%d\n",__func__,(u64)p_file_stat,cold_page_count);
+
 	//如果本次对文件遍历结束后，有未达到BUF_PAGE_COUNT数目要回收的page，这里就隔离+回收这些page
 	if(cold_page_count){
     #ifdef USE_KERNEL_SHRINK_INACTIVE_LIST
@@ -4102,7 +4144,8 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 		isolate_pages += cold_mmap_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
 		reclaimed_pages += cold_file_shrink_pages(p_hot_cold_file_global,p_file_stat,1);
 	#endif
-		printk("5:%s %s file_stat:0x%llx reclaimed_pages:%d isolate_pages:%d\n",__func__,p_file_stat->file_name,(u64)p_file_stat,reclaimed_pages,isolate_pages);
+		if(shrink_page_printk_open)
+			printk("5:%s %s file_stat:0x%llx reclaimed_pages:%d isolate_pages:%d\n",__func__,p_file_stat->file_name,(u64)p_file_stat,reclaimed_pages,isolate_pages);
 	}
 
     /*遍历file_stat->file_area_free_temp链表上已经释放page的file_area，如果长时间还没被访问，那就释放掉file_area。
@@ -4154,7 +4197,8 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 	/*文件的radix tree在遍历完一次所有的page后，可能存在空洞，于是后续还要再遍历文件的radix tree获取之前没有遍历到的page*/
 	reverse_file_stat_radix_tree_hole(p_hot_cold_file_global,p_file_stat);
 
-	printk("%s %s file_stat:0x%llx already_scan_file_area_count:%d reclaimed_pages:%d isolate_pages:%d\n",__func__,p_file_stat->file_name,(u64)p_file_stat,*already_scan_file_area_count,reclaimed_pages,isolate_pages);
+    if(shrink_page_printk_open1)
+	    printk("%s %s file_stat:0x%llx already_scan_file_area_count:%d reclaimed_pages:%d isolate_pages:%d\n",__func__,p_file_stat->file_name,(u64)p_file_stat,*already_scan_file_area_count,reclaimed_pages,isolate_pages);
 	return ret;
 }
 #if 0 //这个函数的作用已经分拆了，第一次扫描文件page并创建file_area的代码已经移动到scan_uninit_file_stat()函数了
@@ -4245,8 +4289,9 @@ out:
 static int traverse_mmap_file_stat_get_cold_page(struct hot_cold_file_global *p_hot_cold_file_global,struct file_stat * p_file_stat,unsigned int scan_file_area_max,unsigned int *already_scan_file_area_count)
 {
 	int ret;
+	if(shrink_page_printk_open)
+		printk("1:%s file_stat:0x%llx file_stat->last_index:%ld file_area_count:%d traverse_done:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index,p_file_stat->file_area_count,p_file_stat->traverse_done);
 
-	printk("1:%s file_stat:0x%llx file_stat->last_index:%ld file_area_count:%d traverse_done:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index,p_file_stat->file_area_count,p_file_stat->traverse_done);
 	if(p_file_stat->max_file_area_age/* || p_file_stat->hot_file_area_cache[0] || p_file_stat->hot_file_area_cache[1] ||p_file_stat->hot_file_area_cache[2]*/){
 		panic("file_stat error p_file_stat:0x%llx\n",(u64)p_file_stat);
 	}
@@ -4477,8 +4522,8 @@ static int get_file_area_from_mmap_file_stat_list(struct hot_cold_file_global *p
 
 	if(list_empty(file_stat_temp_head))
 		return ret;
-
-	printk("1:%s file_stat_last:0x%llx\n",__func__,(u64)p_hot_cold_file_global->file_stat_last);
+	if(shrink_page_printk_open)
+		printk("1:%s file_stat_last:0x%llx\n",__func__,(u64)p_hot_cold_file_global->file_stat_last);
 
 	//每次都从链表尾开始遍历
 	list_for_each_entry_safe_reverse(p_file_stat,p_file_stat_temp,file_stat_temp_head,hot_cold_file_list)
@@ -4490,7 +4535,9 @@ static int get_file_area_from_mmap_file_stat_list(struct hot_cold_file_global *p
 		
 		//遍历指定数目的file_stat和file_area后，强制结束遍历。包括遍历delete等文件
 		if(scan_file_area_count >= scan_file_area_max){
-			printk("%s scan_file_area_count:%d scan_file_stat_count:%d exceed max\n",__func__,scan_file_area_count,scan_file_stat_count);
+			if(shrink_page_printk_open)
+				printk("%s scan_file_area_count:%d scan_file_stat_count:%d exceed max\n",__func__,scan_file_area_count,scan_file_stat_count);
+
 			break;
 		}
 		scan_file_stat_count ++;
@@ -4571,10 +4618,12 @@ static int get_file_area_from_mmap_file_stat_list(struct hot_cold_file_global *p
 			 *解决办法是限制这个file_stat必须处于global temp链表才能移动到file_stat_list临时链表*/
 			if(file_stat_in_file_stat_temp_head_list(p_file_stat))
 			    list_move(&p_file_stat->hot_cold_file_list,&file_stat_list);
-
-			printk("%s p_file_stat:0x%llx file_area:%d scan complete,next scan file_stat:0x%llx\n",__func__,(u64)p_file_stat,p_file_stat->file_area_count,(u64)p_file_stat_temp);
+			if(shrink_page_printk_open)
+				printk("%s p_file_stat:0x%llx file_area:%d scan complete,next scan file_stat:0x%llx\n",__func__,(u64)p_file_stat,p_file_stat->file_area_count,(u64)p_file_stat_temp);
 		}else if(scan_file_area_count  >= scan_file_area_max){
-			printk("%s scan_file_area_count:%d scan_file_stat_count:%d exceed max\n",__func__,scan_file_area_count,scan_file_stat_count);
+			if(shrink_page_printk_open)
+				printk("%s scan_file_area_count:%d scan_file_stat_count:%d exceed max\n",__func__,scan_file_area_count,scan_file_stat_count);
+
 			break;
 		}else{
 			panic("%s file_stat:0x%llx status:0x%lx exception scan_file_area_count:%d scan_file_stat_count:%d ret:%d\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status,scan_file_area_count,scan_file_stat_count,ret);
@@ -4612,8 +4661,9 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 		}
 		mapping = p_file_stat->mapping;
 		file_page_count = p_file_stat->mapping->host->i_size >> PAGE_SHIFT;//除以4096
-		printk("1:%s scan file_stat:0x%llx\n",__func__,(u64)p_file_stat);
 
+		if(shrink_page_printk_open)
+			printk("1:%s scan file_stat:0x%llx\n",__func__,(u64)p_file_stat);
 
 		/*这个while循环扫一个文件file_stat的page，存在的话则创建file_area。有下边这几种情况
 		 *1:文件page太多，扫描的file_area超过mac，文件的page还没扫描完，直接break，下次执行函数还扫描这个文件，直到扫描完
@@ -4624,7 +4674,9 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 			memset(pages,0,PAGE_COUNT_IN_AREA*sizeof(struct page *));
 			//获取p_file_stat->last_index对应的PAGE_COUNT_IN_AREA文件页page指针并保存到pages数组
 			ret = get_page_from_file_area(p_file_stat,p_file_stat->last_index,pages);
-			printk("2:%s file_stat:0x%llx start_page_index:%ld get %d page file_area_count_in_temp_list:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index,ret,p_file_stat->file_area_count_in_temp_list);
+
+			if(shrink_page_printk_open)
+				printk("2:%s file_stat:0x%llx start_page_index:%ld get %d page file_area_count_in_temp_list:%d\n",__func__,(u64)p_file_stat,p_file_stat->last_index,ret,p_file_stat->file_area_count_in_temp_list);
 			/*遇到一个重大问题，上边打印"file_stat:0xffff8c9f5fbb1320 start_page_index:464 get 0 page"，然后之后每次执行该函数，都从global mmap_file_stat_uninit_head
 			 *链表尾遍历file_stat:0xffff8c9f5fbb1320的起始索引是464的4个page，但这些page都没有，于是ret是0，这导致直接goto out。回收每次就陷入了死循环，无法遍历
 			 *global mmap_file_stat_uninit_head链表尾其他file_stat，以及file_stat:0xffff8c9f5fbb1320 start_page_index:464 索引后边的page。简单说，因为一个文件
@@ -4679,8 +4731,10 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 					p_file_stat->file_area_count_in_temp_list ++;
 					/*4个连续的page只要有一个在radix tree找到，分配file_area,之后就不再查找其他page了*/
 					break;
-				}else
-				    printk("4_1:%s file_stat:0x%llx start_page_index:%ld page:0x%llx error\n",__func__,(u64)p_file_stat,p_file_stat->last_index,(u64)page);
+				}else{
+					if(shrink_page_printk_open1)
+						printk("4_1:%s file_stat:0x%llx start_page_index:%ld page:0x%llx error\n",__func__,(u64)p_file_stat,p_file_stat->last_index,(u64)page);
+				}
 			}
 
 			/*如果上边for循环遍历的file_area的page的mapcount都是1，且file_area的page上边没有遍历完，则这里继续遍历完剩余的page*/
@@ -4704,7 +4758,8 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 				clear_file_area_in_temp_list(p_file_area);
 				set_file_area_in_mapcount_list(p_file_area);
 				list_move(&p_file_area->file_area_list,&p_file_stat->file_area_mapcount);
-				printk("5:%s file_stat:0x%llx file_area:0x%llx state:0x%x is mapcount file_area\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
+				if(shrink_page_printk_open)
+					printk("5:%s file_stat:0x%llx file_area:0x%llx state:0x%x is mapcount file_area\n",__func__,(u64)p_file_stat,(u64)p_file_area,p_file_area->file_area_state);
 			}
 
 			//每扫描1个file_area，p_file_stat->last_index加PAGE_COUNT_IN_AREA
@@ -4713,7 +4768,9 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 			//if成立说明整个文件的page都扫描完了
 			if(p_file_stat->last_index >= file_page_count){
 complete:				
-				printk("6:%s file_stat:0x%llx %s all page scan complete p_file_stat->last_index:%ld file_page_count:%d\n",__func__,(u64)p_file_stat,p_file_stat->file_name,p_file_stat->last_index,file_page_count);
+				if(shrink_page_printk_open1)
+					printk("6:%s file_stat:0x%llx %s all page scan complete p_file_stat->last_index:%ld file_page_count:%d\n",__func__,(u64)p_file_stat,p_file_stat->file_name,p_file_stat->last_index,file_page_count);
+
 				//p_file_stat->traverse_done = 1;
 
 				//对file_stat->last_index清0，后续有用于保存最近一次扫描的file_area的索引
@@ -4753,7 +4810,8 @@ complete:
 					set_file_stat_in_mapcount_file_area_list(p_file_stat);
 					list_move(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->mmap_file_stat_mapcount_head);
 					p_hot_cold_file_global->mapcount_mmap_file_stat_count ++;
-					printk("6:%s file_stat:0x%llx status:0x%llx is mapcount file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
+					if(shrink_page_printk_open)
+						printk("6:%s file_stat:0x%llx status:0x%llx is mapcount file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
 				}
 
 				break;
@@ -4801,7 +4859,8 @@ static int scan_mmap_mapcount_file_stat(struct hot_cold_file_global *p_hot_cold_
 					}
 					p_hot_cold_file_global->mapcount_mmap_file_stat_count --;
 					file_stat_change = 1;
-					printk("1:%s file_stat:0x%llx status:0x%llx  mapcount to temp file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
+					if(shrink_page_printk_open1)
+						printk("1:%s file_stat:0x%llx status:0x%llx  mapcount to temp file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
 				}
 			}
 		}
@@ -4856,7 +4915,8 @@ static int scan_mmap_hot_file_stat(struct hot_cold_file_global *p_hot_cold_file_
 					}
 					p_hot_cold_file_global->hot_mmap_file_stat_count --;
 					file_stat_change = 1;
-					printk("1:%s file_stat:0x%llx status:0x%llx  hot to temp file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
+					if(shrink_page_printk_open1)
+						printk("1:%s file_stat:0x%llx status:0x%llx  hot to temp file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
 				}
 			}
 		}
@@ -4882,8 +4942,8 @@ static int walk_throuth_all_mmap_file_area(struct hot_cold_file_global *p_hot_co
 {
 	int ret;
 	unsigned int scan_file_area_max,scan_file_stat_max;
-
-	printk("%s mmap_file_stat_count:%d mapcount_mmap_file_stat_count:%d hot_mmap_file_stat_count:%d\n",__func__,p_hot_cold_file_global->mmap_file_stat_count,p_hot_cold_file_global->mapcount_mmap_file_stat_count,p_hot_cold_file_global->hot_mmap_file_stat_count);
+	if(shrink_page_printk_open)
+		printk("%s mmap_file_stat_count:%d mapcount_mmap_file_stat_count:%d hot_mmap_file_stat_count:%d\n",__func__,p_hot_cold_file_global->mmap_file_stat_count,p_hot_cold_file_global->mapcount_mmap_file_stat_count,p_hot_cold_file_global->hot_mmap_file_stat_count);
 
 	//扫描global mmap_file_stat_uninit_head链表上的file_stat
 	ret = scan_uninit_file_stat(p_hot_cold_file_global,&p_hot_cold_file_global->mmap_file_stat_uninit_head,512);
@@ -4978,7 +5038,8 @@ int add_mmap_file_stat_to_list(struct file *file)
 	spin_unlock(&hot_cold_file_global_info.mmap_file_global_lock);
 	strncpy(p_file_stat->file_name,file->f_path.dentry->d_iname,MMAP_FILE_NAME_LEN-1);
 	p_file_stat->file_name[MMAP_FILE_NAME_LEN-1] = 0;
-	printk("%s file_stat:0x%llx %s\n",__func__,(u64)p_file_stat,file->f_path.dentry->d_iname);
+	if(shrink_page_printk_open)
+		printk("%s file_stat:0x%llx %s\n",__func__,(u64)p_file_stat,file->f_path.dentry->d_iname);
 
 out:
 	return ret;
