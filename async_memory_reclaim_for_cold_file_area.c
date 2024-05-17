@@ -4657,7 +4657,17 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 
 	list_for_each_entry_safe_reverse(p_file_stat,p_file_stat_temp,mmap_file_stat_uninit_head,hot_cold_file_list){
 		if(p_file_stat->file_stat_status != (1 << F_file_stat_in_mmap_file)){
-			panic("%s file_stat:0x%llx status error:0x%lx\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status);
+			/*实际测试这里遇到过file_stat in delte，则把file_stat移动到global mmap_file_stat_temp_head链表尾，
+			 *稍后get_file_area_from_mmap_file_stat_list()函数就会把这个delete的file_stat释放掉*/
+			if(file_stat_in_delete(p_file_stat)){
+				spin_lock(&hot_cold_file_global_info.mmap_file_global_lock);
+				list_move_tail(&p_file_stat->hot_cold_file_list,&p_hot_cold_file_global->mmap_file_stat_temp_head);
+				spin_unlock(&hot_cold_file_global_info.mmap_file_global_lock);
+				printk("%s file_stat:0x%llx status:0x%lx in delete\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status);
+				continue;
+			}
+			else
+				panic("%s file_stat:0x%llx status error:0x%lx\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status);
 		}
 		mapping = p_file_stat->mapping;
 		file_page_count = p_file_stat->mapping->host->i_size >> PAGE_SHIFT;//除以4096
