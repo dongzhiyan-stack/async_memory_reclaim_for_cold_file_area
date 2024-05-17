@@ -4057,7 +4057,7 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 		if(cold_page_count >= BUF_PAGE_COUNT || (BUF_PAGE_COUNT - cold_page_count <=  PAGE_COUNT_IN_AREA)){
 
         #ifdef USE_KERNEL_SHRINK_INACTIVE_LIST
-		    isolate_pages = cold_mmap_file_isolate_lru_pages_and_shrink(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
+		    isolate_pages += cold_mmap_file_isolate_lru_pages_and_shrink(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
 		    reclaimed_pages = p_hot_cold_file_global->hot_cold_file_shrink_counter.mmap_free_pages_count;
         #else		
 			//隔离page
@@ -4138,7 +4138,7 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 	//如果本次对文件遍历结束后，有未达到BUF_PAGE_COUNT数目要回收的page，这里就隔离+回收这些page
 	if(cold_page_count){
     #ifdef USE_KERNEL_SHRINK_INACTIVE_LIST
-		isolate_pages = cold_mmap_file_isolate_lru_pages_and_shrink(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
+		isolate_pages += cold_mmap_file_isolate_lru_pages_and_shrink(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
 		reclaimed_pages = p_hot_cold_file_global->hot_cold_file_shrink_counter.mmap_free_pages_count;
     #else		
 		isolate_pages += cold_mmap_file_isolate_lru_pages(p_hot_cold_file_global,p_file_stat,p_file_area,page_buf,cold_page_count);
