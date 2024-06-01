@@ -3226,7 +3226,7 @@ int hot_cold_file_proc_init(struct hot_cold_file_global *p_hot_cold_file_global)
 {
 	struct proc_dir_entry *p,*hot_cold_file_proc_root;
 
-	hot_cold_file_proc_root = proc_mkdir("async_memory_reclaime", NULL);
+	hot_cold_file_proc_root = proc_mkdir("async_memory_reclaim", NULL);
 	if(!hot_cold_file_proc_root)
 		return -1;
 

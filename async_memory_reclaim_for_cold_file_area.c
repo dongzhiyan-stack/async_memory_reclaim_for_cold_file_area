@@ -707,6 +707,7 @@ static struct file_area *file_area_alloc_and_init(struct hot_cold_file_area_tree
 
 	p_file_stat->file_area_count ++;//文件file_stat的file_area个数加1
 	set_file_area_in_temp_list(p_file_area);//新分配的file_area必须设置in_temp_list链表
+	p_file_stat->file_area_count_in_temp_list ++;//in_temp_list链表的file_area个数加1
 
 out:
     return p_file_area;
@@ -4656,6 +4657,8 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 	struct file_area *p_file_area = NULL;
 
 	list_for_each_entry_safe_reverse(p_file_stat,p_file_stat_temp,mmap_file_stat_uninit_head,hot_cold_file_list){
+#if 0	/*这个方案还是有问题，因为下边遍历文件inode的xarray tree时，inode依然可能会被iput释放，解决办法只能
+         对file_inode_lock加锁，加锁成功后可以放心遍历文件xarray tree，加锁失败则说明文件inode被iput释放了*/
 		if(p_file_stat->file_stat_status != (1 << F_file_stat_in_mmap_file)){
 			/*实际测试这里遇到过file_stat in delte，则把file_stat移动到global mmap_file_stat_temp_head链表尾，
 			 *稍后get_file_area_from_mmap_file_stat_list()函数就会把这个delete的file_stat释放掉*/
@@ -4669,6 +4672,16 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 			else
 				panic("%s file_stat:0x%llx status error:0x%lx\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status);
 		}
+#else
+		//令inode引用计数加1，防止遍历该文件的radix tree时文件inode被释放了
+		if(file_inode_lock(p_file_stat) == 0)
+		{
+			printk("%s file_stat:0x%llx status 0x%lx inode lock fail\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status);
+			continue;
+		}
+		if(p_file_stat->file_stat_status != (1 << F_file_stat_in_mmap_file))
+			panic("%s file_stat:0x%llx status error:0x%lx\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status);
+#endif		
 		mapping = p_file_stat->mapping;
 		file_page_count = p_file_stat->mapping->host->i_size >> PAGE_SHIFT;//除以4096
 
@@ -4697,10 +4710,10 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 				if(p_file_stat->last_index >= file_page_count){
 				    goto complete;
 				}
-
 				continue;
 			}
 			if(ret < 0){
+				file_inode_unlock(p_file_stat);
 				printk("2_1:%s file_stat:0x%llx start_page_index:%ld get %d fail\n",__func__,(u64)p_file_stat,p_file_stat->last_index,ret);
 				goto out; 
 			}
@@ -4724,6 +4737,7 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 					if(IS_ERR(parent_node)){
 						ret = -1;
 						printk("3:%s hot_cold_file_area_tree_lookup_and_create fail\n",__func__);
+				        file_inode_unlock(p_file_stat);
 						goto out;
 					}
 					if(NULL == *page_slot_in_tree){
@@ -4731,6 +4745,7 @@ static int scan_uninit_file_stat(struct hot_cold_file_global *p_hot_cold_file_gl
 						p_file_area = file_area_alloc_and_init(parent_node,page_slot_in_tree,area_index_for_page,p_file_stat);
 						if(p_file_area == NULL){
 							ret = -1;
+				            file_inode_unlock(p_file_stat);
 							goto out;
 						}
 					}
@@ -4823,10 +4838,11 @@ complete:
 					if(shrink_page_printk_open)
 						printk("6:%s file_stat:0x%llx status:0x%llx is mapcount file\n",__func__,(u64)p_file_stat,(u64)p_file_stat->file_stat_status);
 				}
-
 				break;
 			}
 		}
+        /*inode解锁，很关键，否则inode永远无法iput*/
+        file_inode_unlock(p_file_stat);
 
 		//如果扫描的文件页page数达到本次的限制，结束本次的scan
 		if(scan_file_area_count >= scan_file_area_max){
