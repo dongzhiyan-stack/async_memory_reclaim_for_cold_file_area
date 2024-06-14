@@ -4036,7 +4036,8 @@ static unsigned int check_file_area_cold_page_and_clear(struct hot_cold_file_glo
 				 *该临时链表上的不太冷file_area同统一移动到file_stat->file_area_temp链表尾。这样做的目的是，避免该while循环里重复遍历到
 				 *这些file_area*/
 				//list_move_tail(&p_file_area->file_area_list,&p_file_stat->file_area_temp);
-				list_move(&p_file_area->file_area_list,&file_area_temp_head);
+				if(file_area_in_temp_list(p_file_area))
+				    list_move(&p_file_area->file_area_list,&file_area_temp_head);
 			}
 		}else if(ret > 0){
 			/*如果file_area的page被访问了，则把file_area移动到链表头-------这个操作就多余了，去掉，只要把不太冷的file_area移动到
@@ -4604,7 +4605,8 @@ static int get_file_area_from_mmap_file_stat_list(struct hot_cold_file_global *p
 		ret = traverse_mmap_file_stat_get_cold_page(p_hot_cold_file_global,p_file_stat,scan_file_area_max,&scan_file_area_count);
 		//返回值是1是说明当前这个file_stat的temp链表上的file_area已经全扫描完了，则扫描该file_stat在global->mmap_file_stat_temp_large_file_head或global->mmap_file_stat_temp_head链表上的上一个file_stat的file_area
 		if(ret < 0){
-			return -1;
+			//return -1;
+			goto err;
 		}
 
 		/*到这里，只有几种情况
@@ -4630,7 +4632,7 @@ static int get_file_area_from_mmap_file_stat_list(struct hot_cold_file_global *p
 			panic("%s file_stat:0x%llx status:0x%lx exception scan_file_area_count:%d scan_file_stat_count:%d ret:%d\n",__func__,(u64)p_file_stat,p_file_stat->file_stat_status,scan_file_area_count,scan_file_stat_count,ret);
 		}
     }
-
+err:
 	//如果file_stat_list临时链表还有file_stat，则把这些file_stat移动到global temp链表头，下轮循环就能从链表尾巴扫描还没有扫描的file_stat了
 	if(!list_empty(&file_stat_list)){
 		list_splice(&file_stat_list,file_stat_temp_head);
@@ -4850,6 +4852,11 @@ complete:
 		}
 	}
 out:
+	/*到这里时，file_stat正常但p_file_stat->mapping是NULL，为什么？因为此时的p_file_stat是非法的，指向global mmap_file_stat_uninit_head
+	 *链表头本身。在遍历过链表过后的p_file_stat指向的是链表头而不是链表成员，之前出现过block层统计延迟内存越界bug*/
+	//if(p_file_stat)
+	//	file_inode_unlock(p_file_stat);
+	
 	return ret;
 }
 static int scan_mmap_mapcount_file_stat(struct hot_cold_file_global *p_hot_cold_file_global,unsigned int scan_file_area_max)
