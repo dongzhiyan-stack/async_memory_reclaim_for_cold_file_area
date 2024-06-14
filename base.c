@@ -3216,7 +3216,7 @@ void printk_shrink_param(struct hot_cold_file_global *p_hot_cold_file_global,str
 	}
 }
 
-static int async_memory_reclaime_info_show(struct seq_file *m, void *v)
+static int async_memory_reclaim_info_show(struct seq_file *m, void *v)
 {
 	hot_cold_file_print_all_file_stat(&hot_cold_file_global_info,m,1);
 	printk_shrink_param(&hot_cold_file_global_info,m,1);
@@ -3279,9 +3279,9 @@ int hot_cold_file_proc_init(struct hot_cold_file_global *p_hot_cold_file_global)
 		return -1;
 	}
 
-	p = proc_create_single("async_memory_reclaime_info", S_IRUGO, hot_cold_file_proc_root,async_memory_reclaime_info_show);
+	p = proc_create_single("async_memory_reclaim_info", S_IRUGO, hot_cold_file_proc_root,async_memory_reclaim_info_show);
 	if (!p){
-		printk("proc_create async_memory_reclaime_info fail\n");
+		printk("proc_create async_memory_reclaim_info fail\n");
 		return -1;
 	}
 
@@ -3304,11 +3304,11 @@ int hot_cold_file_proc_exit(struct hot_cold_file_global *p_hot_cold_file_global)
 	remove_proc_entry("nr_pages_level",p_hot_cold_file_global->hot_cold_file_proc_root);
 	remove_proc_entry("open_print",p_hot_cold_file_global->hot_cold_file_proc_root);
 
-	remove_proc_entry("async_memory_reclaime_info",p_hot_cold_file_global->hot_cold_file_proc_root);
+	remove_proc_entry("async_memory_reclaim_info",p_hot_cold_file_global->hot_cold_file_proc_root);
 	remove_proc_entry("async_drop_caches",p_hot_cold_file_global->hot_cold_file_proc_root);
 	remove_proc_entry("enable_disable_async_memory_reclaim",p_hot_cold_file_global->hot_cold_file_proc_root);
 
-	remove_proc_entry("async_memory_reclaime",NULL);
+	remove_proc_entry("async_memory_reclaim",NULL);
 	return 0;
 }
 /* 该函数两个作用

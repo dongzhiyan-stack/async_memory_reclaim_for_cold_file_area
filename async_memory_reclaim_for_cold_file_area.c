@@ -5100,7 +5100,7 @@ static void mmap_file_handler_post(struct kprobe *p, struct pt_regs *regs,
 /***以上代码是针对mmap文件的*********************************************************************************************************/
 
 
-static int __init async_memory_reclaime_for_cold_file_area_init(void)
+static int __init async_memory_reclaim_for_cold_file_area_init(void)
 {
 	int ret;
 	//kp_mark_page_accessed.post_handler = mark_page_accessed_handler_post;
@@ -5193,7 +5193,7 @@ err:
 	    hot_cold_file_proc_exit(&hot_cold_file_global_info);
 	return ret;
 }
-static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
+static void __exit async_memory_reclaim_for_cold_file_area_exit(void)
 { 
 	//这里是重点，先等异步内存回收线程结束运行，就不会再使用任何的file_stat了，此时可以放心执行下边的cold_file_delete_all_file_stat()释放所有文件的file_stat
 	kthread_stop(hot_cold_file_global_info.hot_cold_file_thead);
@@ -5254,7 +5254,7 @@ static void __exit async_memory_reclaime_for_cold_file_area_exit(void)
 	kmem_cache_destroy(hot_cold_file_global_info.hot_cold_file_area_tree_node_cachep);
 	hot_cold_file_proc_exit(&hot_cold_file_global_info);
 }
-module_init(async_memory_reclaime_for_cold_file_area_init);
-module_exit(async_memory_reclaime_for_cold_file_area_exit);
+module_init(async_memory_reclaim_for_cold_file_area_init);
+module_exit(async_memory_reclaim_for_cold_file_area_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("hujunpeng : dongzhiyan_linux@163.com");
